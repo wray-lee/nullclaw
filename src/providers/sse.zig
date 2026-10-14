@@ -19,6 +19,7 @@ fn finalizeStreamResult(
     allocator: std.mem.Allocator,
     accumulated: []const u8,
     stream_usage: ?root.TokenUsage,
+    tool_calls: []const root.ToolCall,
 ) !root.StreamChatResult {
     var content: ?[]const u8 = null;
     var reasoning_content: ?[]const u8 = null;
@@ -38,6 +39,7 @@ fn finalizeStreamResult(
         .reasoning_content = reasoning_content,
         .usage = usage,
         .model = "",
+        .tool_calls = tool_calls,
     };
 }
 
@@ -122,16 +124,142 @@ pub const DeltaContent = union(enum) {
     }
 };
 
+/// A partial tool call emitted by an OpenAI-compatible streaming delta.
+///
+/// Every field except `index` is optional: providers split `id`, `name`, and
+/// `arguments` across chunks, and some repeat `id`/`name` on every fragment.
+pub const DeltaToolCall = struct {
+    /// Position of the call within the assistant message (`delta.index`).
+    index: usize,
+    id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments: ?[]const u8 = null,
+};
+
+/// Free the fragments returned by `extractDeltaToolCalls`.
+pub fn freeDeltaToolCalls(allocator: std.mem.Allocator, calls: []DeltaToolCall) void {
+    for (calls) |call| {
+        if (call.id) |v| allocator.free(v);
+        if (call.name) |v| allocator.free(v);
+        if (call.arguments) |v| allocator.free(v);
+    }
+    if (calls.len > 0) allocator.free(calls);
+}
+
+/// Accumulates `delta.tool_calls` fragments into complete tool calls.
+///
+/// Fragments are keyed by `index`, so parallel tool calls and argument
+/// fragments split anywhere in the stream both reassemble correctly. `id` and
+/// `name` are recorded on first sight; repeats (some gateways resend them on
+/// every fragment) are ignored. `arguments` fragments are always concatenated.
+pub const ToolCallAccumulator = struct {
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    const Entry = struct {
+        index: usize,
+        id: ?[]u8 = null,
+        name: ?[]u8 = null,
+        arguments: std.ArrayListUnmanaged(u8) = .empty,
+    };
+
+    pub fn deinit(self: *ToolCallAccumulator, allocator: std.mem.Allocator) void {
+        for (self.entries.items) |*entry| {
+            if (entry.id) |v| allocator.free(v);
+            if (entry.name) |v| allocator.free(v);
+            entry.arguments.deinit(allocator);
+        }
+        self.entries.deinit(allocator);
+        self.entries = .empty;
+    }
+
+    /// Number of distinct tool calls seen so far.
+    pub fn count(self: *const ToolCallAccumulator) usize {
+        return self.entries.items.len;
+    }
+
+    fn findEntry(self: *ToolCallAccumulator, index: usize) ?*Entry {
+        for (self.entries.items) |*entry| {
+            if (entry.index == index) return entry;
+        }
+        return null;
+    }
+
+    /// Merge one chunk's fragments into the accumulator.
+    pub fn apply(self: *ToolCallAccumulator, allocator: std.mem.Allocator, deltas: []const DeltaToolCall) !void {
+        for (deltas) |delta| {
+            var entry = self.findEntry(delta.index) orelse blk: {
+                try self.entries.append(allocator, .{ .index = delta.index });
+                break :blk &self.entries.items[self.entries.items.len - 1];
+            };
+            if (delta.id) |value| {
+                if (entry.id == null and value.len > 0) entry.id = try allocator.dupe(u8, value);
+            }
+            if (delta.name) |value| {
+                if (entry.name == null and value.len > 0) entry.name = try allocator.dupe(u8, value);
+            }
+            if (delta.arguments) |value| {
+                if (value.len > 0) try entry.arguments.appendSlice(allocator, value);
+            }
+        }
+    }
+
+    /// Finalize accumulation and transfer ownership of the complete calls to
+    /// the caller (freed field-by-field like `ChatResponse.deinit`). The
+    /// accumulator is left empty and must still be `deinit`ed.
+    pub fn toOwnedSlice(self: *ToolCallAccumulator, allocator: std.mem.Allocator) ![]root.ToolCall {
+        if (self.entries.items.len == 0) return &.{};
+
+        const calls = try allocator.alloc(root.ToolCall, self.entries.items.len);
+        errdefer allocator.free(calls);
+        var filled: usize = 0;
+        errdefer {
+            for (calls[0..filled]) |call| {
+                if (call.id.len > 0) allocator.free(call.id);
+                if (call.name.len > 0) allocator.free(call.name);
+                if (call.arguments.len > 0) allocator.free(call.arguments);
+            }
+        }
+
+        for (self.entries.items, 0..) |*entry, i| {
+            const arguments = if (entry.arguments.items.len > 0)
+                try allocator.dupe(u8, entry.arguments.items)
+            else
+                "";
+            calls[i] = .{
+                .id = entry.id orelse "",
+                .name = entry.name orelse "",
+                .arguments = arguments,
+            };
+            // Ownership of id/name moves into `calls`; clear so deinit is a no-op.
+            entry.id = null;
+            entry.name = null;
+            filled += 1;
+        }
+        return calls;
+    }
+};
+
 /// Result of parsing a single SSE line.
-pub const SseLineResult = union(enum) {
+pub const SseLineResult = struct {
     /// Text or reasoning delta content (owned, caller frees).
-    delta: DeltaContent,
-    /// Stream is complete ([DONE] sentinel).
-    done: void,
+    delta: ?DeltaContent = null,
+    /// Partial tool-call fragments from `choices[0].delta.tool_calls` (owned, caller frees).
+    tool_calls: []DeltaToolCall = &.{},
     /// Token usage from a stream chunk.
-    usage: root.TokenUsage,
-    /// Line should be skipped (empty, comment, or no content).
-    skip: void,
+    usage: ?root.TokenUsage = null,
+    /// Stream is complete ([DONE] sentinel).
+    done: bool = false,
+
+    pub fn deinit(self: SseLineResult, allocator: std.mem.Allocator) void {
+        if (self.delta) |d| d.deinit(allocator);
+        freeDeltaToolCalls(allocator, self.tool_calls);
+    }
+
+    /// True when the line carried nothing actionable (empty line, comment, or a
+    /// chunk with no content, tool-call, or usage payload).
+    pub fn isSkip(self: SseLineResult) bool {
+        return !self.done and self.delta == null and self.tool_calls.len == 0 and self.usage == null;
+    }
 };
 
 const THINK_OPEN_TAG = "<think>";
@@ -179,34 +307,111 @@ fn appendDeltaContent(
 /// Parse a single SSE line in OpenAI streaming format.
 ///
 /// Handles:
-/// - `data: [DONE]` → `.done`
-/// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
-/// - Empty lines, comments (`:`) → `.skip`
+/// - `data: [DONE]` → `done`
+/// - `data: {JSON}` → extracts `choices[0].delta.content` (or a reasoning
+///   fallback) into `delta`, `choices[0].delta.tool_calls` fragments into
+///   `tool_calls`, and a top-level `usage` object into `usage`. A single chunk
+///   may carry any combination of those.
+/// - Empty lines, comments (`:`) → empty result (`isSkip()`).
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
     const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
-    if (trimmed.len == 0) return .skip;
-    if (trimmed[0] == ':') return .skip;
+    if (trimmed.len == 0) return .{};
+    if (trimmed[0] == ':') return .{};
 
     // SSE uses "data:" with an optional single leading space before the value.
     const prefix = "data:";
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return .{};
 
     const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
         trimmed[prefix.len + 1 ..]
     else
         trimmed[prefix.len..];
 
-    if (data.len == 0) return .skip;
+    if (data.len == 0) return .{};
 
-    if (std.mem.eql(u8, data, "[DONE]")) return .done;
+    if (std.mem.eql(u8, data, "[DONE]")) return .{ .done = true };
 
-    const content = try extractDeltaContent(allocator, data) orelse {
+    var result = SseLineResult{};
+    result.delta = try extractDeltaContent(allocator, data);
+    result.tool_calls = try extractDeltaToolCalls(allocator, data);
+    if (result.delta == null) {
         // No content delta — check for usage data (sent in the final chunk).
-        if (extractStreamUsage(data)) |u| return .{ .usage = u };
-        return .skip;
-    };
-    return .{ .delta = content };
+        if (extractStreamUsage(data)) |u| result.usage = u;
+    }
+    return result;
+}
+
+/// Extract `choices[0].delta.tool_calls` fragments from an SSE JSON payload.
+///
+/// Returns owned fragments (free with `freeDeltaToolCalls`) or an empty slice
+/// when the chunk carries no tool-call delta. A fragment may hold any subset of
+/// `id`/`name`/`arguments`; reassembly is the caller's job — see
+/// `ToolCallAccumulator`.
+pub fn extractDeltaToolCalls(allocator: std.mem.Allocator, json_str: []const u8) ![]DeltaToolCall {
+    // Cheap guard: skip the JSON parse for the (common) non-tool chunks.
+    if (std.mem.indexOf(u8, json_str, "\"tool_calls\"") == null) return &.{};
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return &.{};
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return &.{};
+    const choices = parsed.value.object.get("choices") orelse return &.{};
+    if (choices != .array or choices.array.items.len == 0) return &.{};
+    const first = choices.array.items[0];
+    if (first != .object) return &.{};
+    const delta = first.object.get("delta") orelse return &.{};
+    if (delta != .object) return &.{};
+    const tool_calls = delta.object.get("tool_calls") orelse return &.{};
+    if (tool_calls != .array) return &.{};
+
+    var fragments: std.ArrayListUnmanaged(DeltaToolCall) = .empty;
+    errdefer {
+        freeDeltaToolCalls(allocator, fragments.items);
+        fragments.deinit(allocator);
+    }
+
+    for (tool_calls.array.items, 0..) |item, position| {
+        if (item != .object) continue;
+
+        const index: usize = blk: {
+            if (item.object.get("index")) |index_val| {
+                if (index_val == .integer and index_val.integer >= 0) {
+                    break :blk @intCast(index_val.integer);
+                }
+            }
+            // Some gateways omit `index`; fall back to the array position.
+            break :blk position;
+        };
+
+        var fragment = DeltaToolCall{ .index = index };
+        errdefer {
+            if (fragment.id) |v| allocator.free(v);
+            if (fragment.name) |v| allocator.free(v);
+            if (fragment.arguments) |v| allocator.free(v);
+        }
+
+        if (item.object.get("id")) |id_val| {
+            if (id_val == .string and id_val.string.len > 0) fragment.id = try allocator.dupe(u8, id_val.string);
+        }
+        if (item.object.get("function")) |function_val| {
+            if (function_val == .object) {
+                if (function_val.object.get("name")) |name_val| {
+                    if (name_val == .string and name_val.string.len > 0) fragment.name = try allocator.dupe(u8, name_val.string);
+                }
+                if (function_val.object.get("arguments")) |args_val| {
+                    if (args_val == .string and args_val.string.len > 0) fragment.arguments = try allocator.dupe(u8, args_val.string);
+                }
+            }
+        }
+        try fragments.append(allocator, fragment);
+    }
+
+    if (fragments.items.len == 0) {
+        fragments.deinit(allocator);
+        return &.{};
+    }
+    return try fragments.toOwnedSlice(allocator);
 }
 
 /// Extract `usage` object from an OpenAI-compatible streaming chunk.
@@ -456,6 +661,9 @@ pub fn curlStream(
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
+    var tool_acc = ToolCallAccumulator{};
+    defer tool_acc.deinit(allocator);
+
     const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
@@ -517,21 +725,21 @@ pub fn curlStream(
                     continue;
                 };
                 line_buf.clearRetainingCapacity();
-                switch (result) {
-                    .delta => |content| {
-                        defer content.deinit(allocator);
-                        try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                    },
-                    .usage => |u| stream_usage = u,
-                    .done => {
-                        if (log_enabled) {
-                            debug_log.info("SSE stream done", .{});
-                        }
-                        saw_done = true;
-                        break :outer;
-                    },
-                    .skip => {},
+                defer result.deinit(allocator);
+                if (result.done) {
+                    if (log_enabled) {
+                        debug_log.info("SSE stream done", .{});
+                    }
+                    saw_done = true;
+                    break :outer;
                 }
+                if (result.delta) |content| {
+                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
+                }
+                if (result.tool_calls.len > 0) {
+                    try tool_acc.apply(allocator, result.tool_calls);
+                }
+                if (result.usage) |u| stream_usage = u;
             } else {
                 try line_buf.append(allocator, byte);
             }
@@ -547,15 +755,14 @@ pub fn curlStream(
         const trailing = parseSseLine(allocator, line_buf.items) catch null;
         line_buf.clearRetainingCapacity();
         if (trailing) |result| {
-            switch (result) {
-                .delta => |content| {
-                    defer content.deinit(allocator);
-                    try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
-                },
-                .usage => |u| stream_usage = u,
-                .done => {},
-                .skip => {},
+            defer result.deinit(allocator);
+            if (result.delta) |content| {
+                try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
             }
+            if (result.tool_calls.len > 0) {
+                try tool_acc.apply(allocator, result.tool_calls);
+            }
+            if (result.usage) |u| stream_usage = u;
         }
     }
 
@@ -577,7 +784,7 @@ pub fn curlStream(
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+            return finalizeStreamResult(allocator, accumulated.items, stream_usage, try tool_acc.toOwnedSlice(allocator));
         }
         return error.CurlWaitError;
     };
@@ -590,7 +797,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage, try tool_acc.toOwnedSlice(allocator));
             }
             return error.CurlFailed;
         },
@@ -599,7 +806,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+                return finalizeStreamResult(allocator, accumulated.items, stream_usage, try tool_acc.toOwnedSlice(allocator));
             }
             return error.CurlFailed;
         },
@@ -608,7 +815,7 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
+    return finalizeStreamResult(allocator, accumulated.items, stream_usage, try tool_acc.toOwnedSlice(allocator));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -868,7 +1075,7 @@ pub fn curlStreamAnthropic(
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &.{});
         }
         return error.CurlWaitError;
     };
@@ -877,7 +1084,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &.{});
             }
             return error.CurlFailed;
         },
@@ -885,7 +1092,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &.{});
             }
             return error.CurlFailed;
         },
@@ -893,7 +1100,7 @@ pub fn curlStreamAnthropic(
 
     try validateAnthropicStreamOutcome(accumulated.items.len, saw_done);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+    return finalizeStreamResult(allocator, accumulated.items, anthropic_usage, &.{});
 }
 
 fn validateAnthropicStreamOutcome(accumulated_len: usize, saw_done: bool) !void {
@@ -909,25 +1116,17 @@ fn validateAnthropicStreamOutcome(accumulated_len: usize, saw_done: bool) !void 
 test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
-    switch (result) {
-        .delta => |d| {
-            defer d.deinit(allocator);
-            try std.testing.expectEqualStrings("Hello", d.text);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    defer result.deinit(allocator);
+    try std.testing.expect(result.delta != null);
+    try std.testing.expectEqualStrings("Hello", result.delta.?.text);
 }
 
 test "parseSseLine valid delta without optional space" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
-    switch (result) {
-        .delta => |d| {
-            defer d.deinit(allocator);
-            try std.testing.expectEqualStrings("Hello", d.text);
-        },
-        else => return error.TestUnexpectedResult,
-    }
+    defer result.deinit(allocator);
+    try std.testing.expect(result.delta != null);
+    try std.testing.expectEqualStrings("Hello", result.delta.?.text);
 }
 
 test "appendCurlStallDetectionArgs appends curl speed flags in order" {
@@ -946,12 +1145,12 @@ test "appendCurlStallDetectionArgs appends curl speed flags in order" {
 
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
-    try std.testing.expect(result == .done);
+    try std.testing.expect(result.done);
 }
 
 test "parseSseLine DONE sentinel without optional space" {
     const result = try parseSseLine(std.testing.allocator, "data:[DONE]");
-    try std.testing.expect(result == .done);
+    try std.testing.expect(result.done);
 }
 
 test "curlVersionSupportsFailWithBody rejects curl older than 7.76.0" {
@@ -969,31 +1168,137 @@ test "curlVersionSupportsFailWithBody tolerates suffixes in version token" {
 
 test "parseSseLine empty line" {
     const result = try parseSseLine(std.testing.allocator, "");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine comment" {
     const result = try parseSseLine(std.testing.allocator, ":keep-alive");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine empty data field" {
     const result = try parseSseLine(std.testing.allocator, "data:");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine delta without content" {
     const result = try parseSseLine(std.testing.allocator, "data: {\"choices\":[{\"delta\":{}}]}");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine empty choices" {
     const result = try parseSseLine(std.testing.allocator, "data: {\"choices\":[]}");
-    try std.testing.expect(result == .skip);
+    try std.testing.expect(result.isSkip());
 }
 
 test "parseSseLine invalid JSON" {
     try std.testing.expectError(error.InvalidSseJson, parseSseLine(std.testing.allocator, "data: not-json{{{"));
+}
+
+test "extractDeltaToolCalls returns empty for content-only chunks" {
+    const allocator = std.testing.allocator;
+    const fragments = try extractDeltaToolCalls(allocator, "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}");
+    defer freeDeltaToolCalls(allocator, fragments);
+    try std.testing.expectEqual(@as(usize, 0), fragments.len);
+}
+
+test "parseSseLine extracts a single tool call fragment" {
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\"," ++
+        "\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}";
+    const result = try parseSseLine(allocator, line);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.delta == null);
+    try std.testing.expect(result.usage == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls[0].index);
+    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id.?);
+    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name.?);
+    try std.testing.expectEqualStrings("{\"cmd\":", result.tool_calls[0].arguments.?);
+}
+
+test "parseSseLine keeps content and tool calls from the same chunk" {
+    // Some gateways interleave a text delta with the first tool-call fragment.
+    const allocator = std.testing.allocator;
+    const line = "data: {\"choices\":[{\"delta\":{\"content\":\"thinking\",\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}";
+    const result = try parseSseLine(allocator, line);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqualStrings("thinking", result.delta.?.text);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("call_x", result.tool_calls[0].id.?);
+    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name.?);
+    try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments.?);
+}
+
+test "ToolCallAccumulator reassembles fragmented parallel tool calls" {
+    const allocator = std.testing.allocator;
+
+    var acc = ToolCallAccumulator{};
+    defer acc.deinit(allocator);
+
+    const chunk1 = try extractDeltaToolCalls(allocator, "{\"choices\":[{\"delta\":{\"tool_calls\":[" ++
+        "{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cm\"}}," ++
+        "{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"file_read\",\"arguments\":\"{\\\"pa\"}}" ++
+        "]}}]}");
+    defer freeDeltaToolCalls(allocator, chunk1);
+    try acc.apply(allocator, chunk1);
+
+    // Second chunk repeats id/name (which must be ignored) and finishes both
+    // argument strings.
+    const chunk2 = try extractDeltaToolCalls(allocator, "{\"choices\":[{\"delta\":{\"tool_calls\":[" ++
+        "{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"shell\",\"arguments\":\"d\\\":\\\"ls\\\"}\"}}," ++
+        "{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"file_read\",\"arguments\":\"th\\\":\\\"a.txt\\\"}\"}}" ++
+        "]}}]}");
+    defer freeDeltaToolCalls(allocator, chunk2);
+    try acc.apply(allocator, chunk2);
+
+    try std.testing.expectEqual(@as(usize, 2), acc.count());
+
+    const calls = try acc.toOwnedSlice(allocator);
+    defer {
+        for (calls) |call| {
+            if (call.id.len > 0) allocator.free(call.id);
+            if (call.name.len > 0) allocator.free(call.name);
+            if (call.arguments.len > 0) allocator.free(call.arguments);
+        }
+        allocator.free(calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("call_a", calls[0].id);
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", calls[0].arguments);
+    try std.testing.expectEqualStrings("call_b", calls[1].id);
+    try std.testing.expectEqualStrings("file_read", calls[1].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", calls[1].arguments);
+}
+
+test "ToolCallAccumulator keeps argument-only fragments keyed by index" {
+    const allocator = std.testing.allocator;
+
+    var acc = ToolCallAccumulator{};
+    defer acc.deinit(allocator);
+
+    const fragments = try extractDeltaToolCalls(allocator, "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}");
+    defer freeDeltaToolCalls(allocator, fragments);
+    try acc.apply(allocator, fragments);
+
+    const calls = try acc.toOwnedSlice(allocator);
+    defer {
+        for (calls) |call| {
+            if (call.id.len > 0) allocator.free(call.id);
+            if (call.name.len > 0) allocator.free(call.name);
+            if (call.arguments.len > 0) allocator.free(call.arguments);
+        }
+        allocator.free(calls);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("", calls[0].id);
+    try std.testing.expectEqualStrings("", calls[0].name);
+    try std.testing.expectEqualStrings("{}", calls[0].arguments);
 }
 
 test "extractDeltaContent with content" {
@@ -1212,6 +1517,7 @@ test "finalizeStreamResult separates think blocks into reasoning content" {
         std.testing.allocator,
         "<think>private trace</think>Visible answer",
         .{ .completion_tokens = 4, .total_tokens = 4 },
+        &.{},
     );
     defer {
         if (result.content) |content| std.testing.allocator.free(content);
@@ -1226,13 +1532,10 @@ test "parseSseLine extracts usage from final chunk" {
     const allocator = std.testing.allocator;
     const line = "data: {\"id\":\"chatcmpl-abc\",\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":20,\"total_tokens\":70}}";
     const result = try parseSseLine(allocator, line);
-    switch (result) {
-        .usage => |u| {
-            try std.testing.expectEqual(@as(u32, 50), u.prompt_tokens);
-            try std.testing.expectEqual(@as(u32, 20), u.completion_tokens);
-            try std.testing.expectEqual(@as(u32, 70), u.total_tokens);
-        },
-        else => return error.TestUnexpectedResult,
+    if (result.usage) |u| {
+        try std.testing.expectEqual(@as(u32, 50), u.prompt_tokens);
+        try std.testing.expectEqual(@as(u32, 20), u.completion_tokens);
+        try std.testing.expectEqual(@as(u32, 70), u.total_tokens);
     }
 }
 
@@ -1249,13 +1552,10 @@ test "parseSseLine extracts usage from OpenAI nested usage chunk" {
         "\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0," ++
         "\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}}}";
     const result = try parseSseLine(allocator, line);
-    switch (result) {
-        .usage => |u| {
-            try std.testing.expectEqual(@as(u32, 9), u.prompt_tokens);
-            try std.testing.expectEqual(@as(u32, 9), u.completion_tokens);
-            try std.testing.expectEqual(@as(u32, 18), u.total_tokens);
-        },
-        else => return error.TestUnexpectedResult,
+    if (result.usage) |u| {
+        try std.testing.expectEqual(@as(u32, 9), u.prompt_tokens);
+        try std.testing.expectEqual(@as(u32, 9), u.completion_tokens);
+        try std.testing.expectEqual(@as(u32, 18), u.total_tokens);
     }
 }
 

@@ -369,6 +369,7 @@ pub const ReliableProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -649,6 +650,20 @@ pub const ReliableProvider = struct {
         if (self.inner.supportsNativeTools()) return true;
         for (self.extras) |entry| {
             if (entry.provider.supportsNativeTools()) return true;
+        }
+        return false;
+    }
+
+    /// Mirrors `supportsVisionForModelImpl`: an explicit `provider/model` ref is
+    /// answered by the provider that will actually serve it, so a wrapper that
+    /// is not itself capable still reports true when its target is.
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        const target = self.resolveProviderTarget(model);
+        if (target.explicit) return target.provider.supportsStreamingNativeTools(target.model);
+        if (self.inner.supportsStreamingNativeTools(model)) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsStreamingNativeTools(model)) return true;
         }
         return false;
     }
@@ -1346,6 +1361,112 @@ test "warmup calls inner and extras" {
     try std.testing.expect(inner_mock.warmed_up);
     try std.testing.expect(extra_mock.warmed_up);
 }
+
+/// Mock provider with a name, a fail switch, and the streaming
+/// native-tools capability, used by the routing/capability tests below.
+const StreamingToolsMock = struct {
+    name: []const u8,
+    streaming_native_tools: bool,
+    fail: bool = false,
+    calls: u32 = 0,
+    last_model_buf: [64]u8 = undefined,
+    last_model_len: usize = 0,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .supports_streaming = supportsStreaming,
+        .supports_streaming_native_tools = supportsStreamingNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+
+    fn toProvider(self: *StreamingToolsMock) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn lastModel(self: *const StreamingToolsMock) []const u8 {
+        return self.last_model_buf[0..self.last_model_len];
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return error.ShouldNotUseChatWithSystem;
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ChatRequest,
+        model: []const u8,
+        _: f64,
+    ) anyerror!ChatResponse {
+        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        const copy_len = @min(model.len, self.last_model_buf.len);
+        @memcpy(self.last_model_buf[0..copy_len], model[0..copy_len]);
+        self.last_model_len = copy_len;
+        if (self.fail) return error.ProviderError;
+        return ChatResponse{ .content = try allocator.dupe(u8, "routed") };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn supportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreamingNativeTools(ptr: *anyopaque, _: []const u8) bool {
+        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
+        return self.streaming_native_tools;
+    }
+
+    fn getName(ptr: *anyopaque) []const u8 {
+        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
+        return self.name;
+    }
+
+    fn deinit(_: *anyopaque) void {}
+};
+
+test "ReliableProvider delegates supportsStreamingNativeTools to a capable inner" {
+    var capable = StreamingToolsMock{ .name = "capable", .streaming_native_tools = true };
+    var reliable = ReliableProvider.initWithProvider(capable.toProvider(), 0, 50);
+    try std.testing.expect(reliable.provider().supportsStreamingNativeTools("gpt-4o"));
+
+    var plain = StreamingToolsMock{ .name = "plain", .streaming_native_tools = false };
+    var reliable_plain = ReliableProvider.initWithProvider(plain.toProvider(), 0, 50);
+    try std.testing.expect(!reliable_plain.provider().supportsStreamingNativeTools("gpt-4o"));
+}
+
+test "ReliableProvider resolves supportsStreamingNativeTools through an explicit prefix" {
+    // Regression: a wrapper must report the capability of the provider that
+    // actually serves the request, not of the primary one.
+    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = true };
+    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = false };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "newapi", .provider = newapi.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    // The prefix wins over the (capable) primary provider.
+    try std.testing.expect(!prov.supportsStreamingNativeTools("newapi/dpsk"));
+    // A bare model still resolves to the primary provider.
+    try std.testing.expect(prov.supportsStreamingNativeTools("dpsk"));
+}
+
+
 
 test "multi-provider fallback: primary fails, extra succeeds" {
     var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };

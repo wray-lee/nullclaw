@@ -158,6 +158,7 @@ pub const RouterProvider = struct {
         .supports_vision = supportsVisionImpl,
         .supports_vision_for_model = supportsVisionForModelImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
         .stream_chat = streamChatImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -246,6 +247,17 @@ pub const RouterProvider = struct {
         return self.providers[provider_idx].supportsStreaming();
     }
 
+    /// Resolve `model` the same way `streamChatImpl` does, so the answer
+    /// describes the provider that will actually serve the stream.
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, model: []const u8) bool {
+        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
+        const resolved = self.resolve(model);
+        const provider_idx = resolved[0];
+        const resolved_model = resolved[1];
+        if (provider_idx >= self.providers.len) return false;
+        return self.providers[provider_idx].supportsStreamingNativeTools(resolved_model);
+    }
+
     fn streamChatImpl(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -291,6 +303,7 @@ const MockProvider = struct {
     native_tools: bool,
     supports_vision: bool = true,
     supports_streaming: bool = false,
+    streaming_native_tools: bool = false,
     warmup_count: u32 = 0,
     last_tool_model: []const u8 = "",
     last_stream_model: []const u8 = "",
@@ -327,6 +340,7 @@ const MockProvider = struct {
         .supportsNativeTools = mockSupportsNativeTools,
         .warmup = mockWarmup,
         .supports_streaming = mockSupportsStreaming,
+        .supports_streaming_native_tools = mockSupportsStreamingNativeTools,
         .stream_chat = mockStreamChat,
         .supports_vision = mockSupportsVision,
         .getName = mockGetName,
@@ -381,6 +395,11 @@ const MockProvider = struct {
     fn mockSupportsStreaming(ptr: *anyopaque) bool {
         const self: *MockProvider = @ptrCast(@alignCast(ptr));
         return self.supports_streaming;
+    }
+
+    fn mockSupportsStreamingNativeTools(ptr: *anyopaque, _: []const u8) bool {
+        const self: *MockProvider = @ptrCast(@alignCast(ptr));
+        return self.streaming_native_tools;
     }
 
     fn mockStreamChat(
@@ -794,6 +813,28 @@ test "vtable supportsNativeTools false when no providers" {
     defer prov.deinit();
 
     try std.testing.expect(!prov.supportsNativeTools());
+}
+
+test "vtable supportsStreamingNativeTools follows the resolved provider" {
+    const provider_names = [_][]const u8{ "default", "newapi" };
+    var mock_default = MockProvider.init("ok", false);
+    var mock_newapi = MockProvider.init("ok", true);
+    mock_newapi.streaming_native_tools = true;
+    const providers = [_]Provider{ mock_default.provider(), mock_newapi.provider() };
+    var router = try RouterProvider.init(
+        std.testing.allocator,
+        &provider_names,
+        &providers,
+        &.{},
+        "default-model",
+    );
+    const prov = router.provider();
+    defer prov.deinit();
+
+    // An explicit provider ref resolves to the capable provider.
+    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
+    // A bare model resolves to the default provider, which is not capable.
+    try std.testing.expect(!prov.supportsStreamingNativeTools("default-model"));
 }
 
 test "vtable supportsNativeTools follows default model route" {

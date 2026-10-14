@@ -1144,6 +1144,7 @@ pub const OpenAiCompatibleProvider = struct {
         .deinit = deinitImpl,
         .stream_chat = streamChatImpl,
         .supports_streaming = supportsStreamingImpl,
+        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
     };
 
     fn buildSingleTurnMessages(
@@ -1301,6 +1302,13 @@ pub const OpenAiCompatibleProvider = struct {
     fn supportsStreamingImpl(ptr: *anyopaque) bool {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         return !self.disable_streaming and self.api_mode != .responses;
+    }
+
+    /// OpenAI-compatible chat-completions streams carry `delta.tool_calls`
+    /// fragments, so native tools can stay enabled while streaming.
+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, _: []const u8) bool {
+        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
+        return self.native_tools and supportsStreamingImpl(ptr);
     }
 
     fn chatWithSystemImpl(
@@ -2738,6 +2746,48 @@ test "buildStreamingChatRequestBody contains stream true" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
+}
+
+test "buildStreamingChatRequestBody includes tools and tool_choice" {
+    // Regression: streaming requests used to drop `tools`, so an
+    // OpenAI-compatible gateway streaming a tool call could not be answered
+    // with native tool calls.
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const specs = [_]root.ToolSpec{.{ .name = "shell", .description = "run a command", .parameters_json = "{}" }};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test-model", .tools = &specs };
+
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "buildStreamingChatRequestBody omits tools when none are supplied" {
+    const allocator = std.testing.allocator;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test-model" };
+
+    const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, false, false, false, false, null, null);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
+}
+
+test "supportsStreamingNativeTools follows native_tools and streaming support" {
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
+    try std.testing.expect(p.provider().supportsStreamingNativeTools("test-model"));
+
+    var no_native = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
+    no_native.native_tools = false;
+    try std.testing.expect(!no_native.provider().supportsStreamingNativeTools("test-model"));
+
+    var no_stream = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
+    no_stream.disable_streaming = true;
+    try std.testing.expect(!no_stream.provider().supportsStreamingNativeTools("test-model"));
 }
 
 test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort unset" {

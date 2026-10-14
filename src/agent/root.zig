@@ -2011,7 +2011,10 @@ pub const Agent = struct {
             defer prompt_tools_arena.deinit();
             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
             const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
+            const prompt_native_tools_enabled = if (prompt_is_streaming)
+                self.provider.supportsStreamingNativeTools(turn_model_name)
+            else
+                self.provider.supportsNativeTools();
 
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
@@ -2189,7 +2192,13 @@ pub const Agent = struct {
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
-            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            // Native tools stay enabled on streaming turns when the provider can
+            // emit tool-call deltas (OpenAI-compatible chat completions); every
+            // other provider keeps the text tool protocol while streaming.
+            const native_tools_enabled = if (is_streaming)
+                self.provider.supportsStreamingNativeTools(turn_model_name)
+            else
+                self.provider.supportsNativeTools();
             const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
@@ -2205,7 +2214,7 @@ pub const Agent = struct {
                 turn_max_tokens,
             );
 
-            // Call provider: streaming (no retries, no native tools) or blocking with retry
+            // Call provider: streaming (no retries) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
@@ -2220,7 +2229,7 @@ pub const Agent = struct {
                         .model = turn_model_name,
                         .temperature = self.temperature,
                         .max_tokens = request_max_tokens,
-                        .tools = null,
+                        .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                         .include_reasoning = include_reasoning,
@@ -2257,7 +2266,7 @@ pub const Agent = struct {
                                 .model = turn_model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = retry_max_tokens,
-                                .tools = null,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                                 .include_reasoning = include_reasoning,
@@ -2280,7 +2289,7 @@ pub const Agent = struct {
                 response = ChatResponse{
                     .content = stream_result.content,
                     .reasoning_content = stream_result.reasoning_content,
-                    .tool_calls = &.{},
+                    .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };
@@ -5343,6 +5352,7 @@ test "Agent.fromConfig applies default_queue_mode" {
     try std.testing.expectEqual(Agent.QueueMode.latest, agent.default_queue_mode);
     try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
 }
+
 
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
@@ -11007,6 +11017,149 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
     try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
+}
+
+test "Agent executes native tool calls returned by a streaming provider" {
+    // Regression: streaming turns used to force the text tool protocol, so a
+    // provider that streams OpenAI-style `delta.tool_calls` (for example
+    // DeepSeek behind an OpenAI-compatible gateway) had its tool calls shown to
+    // the user as plain text and never executed.
+    const EchoTool = struct {
+        const Self = @This();
+        pub const tool_name = "stream_echo";
+        pub const tool_description = "Echoes a fixed marker for the streaming tool test.";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "stream tool ok") };
+        }
+    };
+
+    const StreamingToolProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+        saw_tools: [2]bool = .{ false, false },
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreamingNativeTools(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slot = @min(self.calls, 1);
+            self.saw_tools[slot] = request.tools != null and request.tools.?.len > 0;
+            self.calls += 1;
+
+            if (self.calls == 1) {
+                callback(callback_ctx, providers.StreamChunk.textDelta("calling"));
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-stream-1"),
+                    .name = try allocator.dupe(u8, "stream_echo"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "calling"),
+                    .model = try allocator.dupe(u8, model),
+                    .tool_calls = tool_calls,
+                };
+            }
+
+            callback(callback_ctx, providers.StreamChunk.textDelta("all done"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator.dupe(u8, "all done"),
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingToolProvider.chatWithSystem,
+        .chat = StreamingToolProvider.chat,
+        .supportsNativeTools = StreamingToolProvider.supportsNativeTools,
+        .getName = StreamingToolProvider.getName,
+        .deinit = StreamingToolProvider.deinitFn,
+        .supports_streaming = StreamingToolProvider.supportsStreaming,
+        .supports_streaming_native_tools = StreamingToolProvider.supportsStreamingNativeTools,
+        .stream_chat = StreamingToolProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var tool_state = EchoTool{};
+    const tool = tool_state.tool();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &.{tool}, null, observer.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            if (chunk.is_final or chunk.delta.len == 0) return;
+            const buf: *std.ArrayListUnmanaged(u8) = @ptrCast(@alignCast(ctx));
+            buf.appendSlice(std.testing.allocator, chunk.delta) catch {};
+        }
+    };
+    var streamed: std.ArrayListUnmanaged(u8) = .empty;
+    defer streamed.deinit(allocator);
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&streamed);
+
+    const response = try agent.turn("call the echo tool");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    // Tools must be advertised on both streaming requests (the tool-call turn
+    // and the follow-up turn that consumes the tool result).
+    try std.testing.expect(provider_state.saw_tools[0]);
+    try std.testing.expect(provider_state.saw_tools[1]);
+    try std.testing.expectEqualStrings("all done", response);
+    try std.testing.expectEqualStrings("callingall done", streamed.items);
+    try std.testing.expect(observer.tool_call_count >= 1);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {
