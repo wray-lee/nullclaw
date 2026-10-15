@@ -205,6 +205,11 @@ pub const ChatResponse = struct {
     model: []const u8 = "",
     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
     reasoning_content: ?[]const u8 = null,
+    /// True when the provider signalled it stopped to invoke a tool
+    /// (finish_reason "tool_calls" / stop_reason "tool_use") regardless of
+    /// whether any call could be parsed. Structural stall signal; the agent
+    /// uses it to nudge or fail explicitly instead of returning silently.
+    finish_tool_use: bool = false,
 
     /// True when the LLM wants to invoke at least one tool.
     pub fn hasToolCalls(self: ChatResponse) bool {
