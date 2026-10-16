@@ -3547,6 +3547,10 @@ test "missing thinking field error switches assistant history to reasoning_conte
 }
 
 test "reasoning_effort reaches non-OpenAI compatible models" {
+    // Regression: appendGenerationFields emitted reasoning_effort only for
+    // the OpenAI reasoning models isReasoningModel recognised, so /think and
+    // the config level were silently dropped on other OpenAI-compatible
+    // models (DeepSeek, Kimi, K2) that take the same top-level field.
     const allocator = std.testing.allocator;
     const msgs = [_]ChatMessage{ChatMessage.user("hi")};
     inline for (.{ .{ "high", "high" }, .{ "max", "max" }, .{ "minimal", "low" } }) |case| {
@@ -3565,6 +3569,10 @@ test "reasoning_effort reaches non-OpenAI compatible models" {
 }
 
 test "rejected reasoning_effort is lowered per model, then dropped" {
+    // Regression: an endpoint that rejects a level above high (IFM K2
+    // answers 400 "Invalid value for 'reasoning_effort'" for xhigh/max)
+    // failed the request instead of retrying; the level must be lowered to
+    // high for that model, then dropped if high is rejected too.
     const allocator = std.testing.allocator;
     root.clearLastApiErrorDetail();
     defer root.clearLastApiErrorDetail();
