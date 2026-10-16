@@ -2758,11 +2758,13 @@ test "slack streaming keeps the native path across chunks of one turn" {
     defer ch.channel().stop();
 
     try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    // A second delta inside the flush window is coalesced rather than sent, but
+    // the turn must keep using the native transport.
     try ch.channel().sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
 
     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
-    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
+    try std.testing.expectEqualStrings("x" ** 200, state.sent);
 }
 
 test "slack streaming uses edited messages when the target has no thread" {
