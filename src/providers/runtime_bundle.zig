@@ -729,6 +729,8 @@ test "RuntimeProviderBundle makes non-fallback configured providers routable" {
 }
 
 test "RuntimeProviderBundle keeps fallback providers in the failover chain" {
+    // Regression: fallback providers must stay in `extras` and non-fallback
+    // configured providers must land in `routable`, never in the failover chain.
     const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
         .{ .name = "openrouter", .api_key = "primary-key" },
         .{ .name = "newapi", .api_key = "newapi-key" },

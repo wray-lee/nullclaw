@@ -1420,6 +1420,8 @@ test "ReliableProvider routes an explicit prefix to a non-failover provider" {
 }
 
 test "ReliableProvider keeps failover limited to extras" {
+    // Regression: registering configured providers as routable must not widen
+    // the failover chain; a bare model still fails over only through `extras`.
     var primary = ModelAwareMock.initWithFailModels(&.{"dpsk"}, "primary");
     var fallback = ModelAwareMock{ .response = "routed" };
     var newapi = ModelAwareMock{ .response = "routable" };
