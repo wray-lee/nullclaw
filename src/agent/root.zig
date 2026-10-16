@@ -2714,12 +2714,16 @@ pub const Agent = struct {
                 // Auto-save assistant response
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        // Truncate to ~100 bytes on a valid UTF-8 boundary
-                        const summary = if (base_text.len > 100) blk: {
+                        // Truncate to ~100 bytes on a valid UTF-8 boundary. Derive
+                        // the summary from the markup-free text so a garbled closer
+                        // cannot persist in autosaved memory (the delivered reply
+                        // and the stored history are stripped too).
+                        const summary_text = try providers.stripToolCallMarkup(arena, base_text);
+                        const summary = if (summary_text.len > 100) blk: {
                             var end: usize = 100;
-                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
-                            break :blk base_text[0..end];
-                        } else base_text;
+                            while (end > 0 and summary_text[end] & 0xC0 == 0x80) end -= 1;
+                            break :blk summary_text[0..end];
+                        } else summary_text;
                         const safe_summary = if (self.redactor) |r|
                             r.redact(arena, summary) catch null
                         else
@@ -12881,4 +12885,41 @@ test "Agent turn nudges on a lone closer after an unclosed fence" {
     defer allocator.free(response);
     try std.testing.expectEqual(@as(usize, 2), state.idx);
     try std.testing.expectEqualStrings("最终答案。", response);
+}
+
+test "Agent: autosave stores the markup-free reply summary" {
+    // Regression: pre-fix the autosave summary was derived from the unstripped
+    // base_text, so a garbled `</function>` closer persisted in conversation
+    // memory even though the delivered reply and the stored history were
+    // stripped. The summary is now derived from the markup-free text.
+    const allocator = std.testing.allocator;
+    const garbled = "核心数据到手了。\n</function>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = garbled },
+        .{ .text = garbled },
+    } };
+    const provider = scriptedProvider(&state);
+
+    var mem_backend = memory_mod.memory_lru.InMemoryLruMemory.init(allocator, 16);
+    defer mem_backend.deinit();
+    const mem = mem_backend.memory();
+
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    agent.mem = mem;
+    agent.auto_save = true;
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+
+    const entries = try mem.list(allocator, .conversation, null);
+    defer memory_mod.freeEntries(allocator, entries);
+
+    var saw_answer = false;
+    for (entries) |entry| {
+        try std.testing.expect(std.mem.indexOf(u8, entry.content, "</function") == null);
+        if (std.mem.indexOf(u8, entry.content, "核心数据到手了。") != null) saw_answer = true;
+    }
+    try std.testing.expect(saw_answer);
 }
