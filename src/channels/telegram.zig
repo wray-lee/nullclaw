@@ -5993,6 +5993,10 @@ test "startTyping (daemon indicator) does not claim the live draft" {
     var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
     defer ch.channel().stop();
 
+    // Regression: a message arriving mid-turn used to reset the live draft the
+    // running turn still owned, so its later streamed chunks were dropped and only
+    // the "Interim result is still being prepared." heartbeat remained. This
+    // daemon-indicator path must start only the typing loop, never claim the draft.
     try ch.startTyping("12345");
 
     ch.draft_mu.lock();
