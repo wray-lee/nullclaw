@@ -68,6 +68,7 @@ pub const stripThinkBlocks = helpers.stripThinkBlocks;
 pub const extractReasoningTextFromDetails = helpers.extractReasoningTextFromDetails;
 pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
 pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
+pub const stripToolCallMarkup = helpers.stripToolCallMarkup;
 
 // Direct re-exports from utility modules
 pub const appendJsonString = json_util.appendJsonString;
