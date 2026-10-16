@@ -1071,9 +1071,18 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
         return;
     };
     message.draft_id = ctx.draft_id;
-    ctx.event_bus.publishOutbound(message) catch |err| {
+    // A stream chunk is a droppable preview: never block the agent turn waiting
+    // for outbound-queue space. The single outbound dispatcher can be parked in
+    // a slow channel call, and blocking here kept the turn alive (and deaf to
+    // /stop) until the backlog drained. A timeout of 0 drops the chunk the
+    // moment the queue is full instead of sleeping.
+    ctx.event_bus.publishOutboundTimeout(message, 0) catch |err| {
         message.deinit(ctx.allocator);
-        if (err != error.Closed) {
+        if (err == error.Timeout) {
+            // The dispatcher is behind; drop this preview instead of parking the
+            // turn on a full queue.
+            log.debug("inbound dispatch dropped a stream chunk: outbound queue full", .{});
+        } else if (err != error.Closed) {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
         return;
@@ -3748,4 +3757,41 @@ test "markError records AddressInUse for gateway component" {
     try std.testing.expect(!state.components[0].?.running);
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
+}
+
+test "publishStreamingChunk drops a preview instead of blocking on a full outbound queue" {
+    const allocator = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var filled: usize = 0;
+    while (filled < bus_mod.QUEUE_CAPACITY) : (filled += 1) {
+        try event_bus.publishOutbound(try bus_mod.makeOutbound(allocator, "c", "t", "x"));
+    }
+
+    var ctx = StreamingOutboundCtx{
+        .allocator = allocator,
+        .event_bus = &event_bus,
+        .channel = "c",
+        .account_id = null,
+        .chat_id = "t",
+    };
+    publishStreamingChunk(&ctx, .{ .stage = .chunk, .text = "hello" });
+
+    // Regression: a full queue used to park the turn here forever, keeping it
+    // running (and unresponsive to /stop) until the dispatcher drained. The
+    // preview must be dropped and the call must return at once.
+    try std.testing.expect(!ctx.emitted_chunk);
+
+    // Close first: consumeOutbound blocks on an empty open queue.
+    event_bus.close();
+    var remaining: usize = 0;
+    while (event_bus.consumeOutbound()) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+        remaining += 1;
+    }
+    // The dropped preview was never enqueued: the queue still holds exactly the
+    // chunks that were there before the call.
+    try std.testing.expectEqual(bus_mod.QUEUE_CAPACITY, remaining);
 }
