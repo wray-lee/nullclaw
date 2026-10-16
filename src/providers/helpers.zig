@@ -11,6 +11,126 @@ const ToolSpec = root.ToolSpec;
 const think_open_tag = "<think>";
 const think_close_tag = "</think>";
 
+// ── Reasoning-tag recognition ─────────────────────────────────────────────
+//
+// The plain `<think>`/`</think>` forms are only one spelling. Reasoning
+// gateways for non-OpenAI models wrap the same region in a namespaced or
+// pipe-delimited tag — the IFM K2 gateway leaks `</ifm|think>` into the content
+// stream with no opener — and OpenClaw recognises `antml:*`/`mm:*` namespaced
+// tags plus `<|…|>` control tokens. A single scanner classifies them so the
+// streaming `TagFilter` and the batch helpers agree.
+
+/// Longest reasoning tag the scanner will accept (`</namespace|thinking>`), so
+/// an incremental caller can keep a bounded buffer.
+pub const max_think_tag_len = 32;
+
+fn isTagNameByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '-';
+}
+
+fn isThinkLeaf(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "think") or std.ascii.eqlIgnoreCase(name, "thinking");
+}
+
+fn isThinkLeafPrefix(name: []const u8) bool {
+    const target = "thinking";
+    if (name.len > target.len) return false;
+    return std.ascii.eqlIgnoreCase(target[0..name.len], name);
+}
+
+/// A recognised reasoning (think) tag.
+pub const ThinkTag = struct {
+    /// True for a closing tag (`</…>`).
+    close: bool,
+    /// Total byte length, including `<`, `</` and the terminating `>`.
+    len: usize,
+};
+
+/// How a `<`-prefixed byte run classifies as a reasoning tag.
+pub const ThinkTagScan = union(enum) {
+    /// Not a reasoning tag, and no extension can make it one.
+    none,
+    /// Still a valid prefix of a reasoning tag — an incremental caller buffers.
+    partial,
+    /// A complete reasoning tag; `len` is its length.
+    complete: ThinkTag,
+};
+
+/// Classify a byte run starting at `<` (which must be `text[0]`) as a reasoning
+/// tag. Recognises `<think>`/`<thinking>` and their closers plus the namespaced
+/// and pipe-delimited spellings gateways leak: `<ifm|think>`, `</ifm|think>`,
+/// `<mm:think>`, `<|think|>`, `</|thinking|>`. Bytes after the tag are ignored,
+/// so the same scanner serves a bounded stream buffer and a whole response.
+pub fn scanThinkTag(text: []const u8) ThinkTagScan {
+    if (text.len == 0 or text[0] != '<') return .none;
+    var i: usize = 1;
+    var close = false;
+    if (i < text.len and text[i] == '/') {
+        close = true;
+        i += 1;
+    }
+    // Optional namespace, then `:` or `|`, then the `think` leaf. Without a
+    // separator the whole name is the leaf (`<think>`).
+    const first_start = i;
+    while (i < text.len and isTagNameByte(text[i])) i += 1;
+    if (i > max_think_tag_len) return .none;
+    const first = text[first_start..i];
+    var leaf = first;
+    var had_sep = false;
+    if (i < text.len and (text[i] == ':' or text[i] == '|')) {
+        had_sep = true;
+        i += 1;
+        const leaf_start = i;
+        while (i < text.len and isTagNameByte(text[i])) i += 1;
+        if (i > max_think_tag_len) return .none;
+        leaf = text[leaf_start..i];
+    }
+    // A pipe-token closer (`<|think|>`).
+    if (i < text.len and text[i] == '|') i += 1;
+    if (i < text.len and text[i] == '>') {
+        i += 1;
+        if (!isThinkLeaf(leaf)) return .none;
+        return .{ .complete = .{ .close = close, .len = i } };
+    }
+    if (i >= text.len) {
+        // Incomplete: valid iff the leaf can still become think/thinking, or
+        // (before any separator) the run can still gain `|`/`:` and a leaf.
+        if (isThinkLeafPrefix(leaf)) return .partial;
+        if (!had_sep and first.len > 0) return .partial;
+    }
+    return .none;
+}
+
+/// The reasoning tag starting at `text[start]`, or null. Whole-text callers use
+/// this; the streaming `TagFilter` uses `scanThinkTag` directly so it can also
+/// observe `.partial`.
+fn matchThinkTag(text: []const u8, start: usize) ?ThinkTag {
+    if (start >= text.len or text[start] != '<') return null;
+    return switch (scanThinkTag(text[start..])) {
+        .complete => |tag| tag,
+        else => null,
+    };
+}
+
+/// True when `text` contains any reasoning tag (opener or closer).
+fn hasThinkTag(text: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '<')) |lt| {
+        if (matchThinkTag(text, lt) != null) return true;
+        i = lt + 1;
+    }
+    return false;
+}
+
+/// True when a stray reasoning closer separates two non-empty visible runs —
+/// i.e. the text before it is a leaked reasoning draft, not the answer.
+/// Mirrors OpenClaw's `hasOrphanReasoningCloseBoundary`.
+pub fn hasOrphanReasoningCloseBoundary(before: []const u8, after: []const u8) bool {
+    return std.mem.trim(u8, before, " \t\r\n").len > 0 and
+        std.mem.trim(u8, after, " \t\r\n").len > 0;
+}
+
 /// Result of splitting a response text at <think>…</think> blocks.
 pub const SplitThinkContent = struct {
     /// Text outside think blocks (the user-visible answer).
@@ -1503,16 +1623,31 @@ fn scanThinkContent(
 ) !void {
     var i: usize = 0;
     var depth: usize = 0;
+    // Offset in `visible_out` at the last reasoning-tag boundary, so an orphan
+    // closer's "before" is the run since that tag (OpenClaw's `beforeTag`),
+    // while the reset still drops every accumulated draft byte.
+    var seg_start: usize = 0;
     while (i < text.len) {
-        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
-            depth += 1;
-            i += think_open_tag.len;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
-            if (depth > 0) depth -= 1;
-            i += think_close_tag.len;
-            continue;
+        if (text[i] == '<') {
+            if (matchThinkTag(text, i)) |tag| {
+                if (tag.close) {
+                    if (depth > 0) {
+                        depth -= 1;
+                    } else if (hasOrphanReasoningCloseBoundary(visible_out.items[seg_start..], text[i + tag.len ..])) {
+                        // A stray reasoning closer: the visible text before it
+                        // was leaked reasoning (a draft the model wrote as
+                        // thinking), not the answer. Drop it and keep only what
+                        // follows, matching OpenClaw's orphan-close rule.
+                        visible_out.clearRetainingCapacity();
+                        seg_start = 0;
+                    }
+                } else {
+                    depth += 1;
+                }
+                i += tag.len;
+                seg_start = visible_out.items.len;
+                continue;
+            }
         }
         if (depth == 0) {
             try visible_out.append(allocator, text[i]);
@@ -1526,7 +1661,7 @@ fn scanThinkContent(
 /// Split `text` into visible content and reasoning extracted from <think>…</think> blocks.
 /// Both returned slices are caller-owned (allocated with `allocator`).
 pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+    if (!hasThinkTag(text)) {
         return .{
             .visible = try allocator.dupe(u8, text),
             .reasoning = null,
@@ -1552,7 +1687,7 @@ pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitT
 
 /// Strip all <think>…</think> blocks from `text`. Returns caller-owned slice.
 pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
+    if (!hasThinkTag(text)) {
         return allocator.dupe(u8, text);
     }
 
@@ -2342,6 +2477,77 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+test "scanThinkTag recognizes plain, namespaced and pipe reasoning tags" {
+    const tags = [_][]const u8{
+        "<think>",     "</think>",
+        "<thinking>",  "</thinking>",
+        "<ifm|think>", "</ifm|think>",
+        "<mm:think>",  "</mm:thinking>",
+        "<|think|>",   "</|think|>",
+    };
+    for (tags) |tag| {
+        switch (scanThinkTag(tag)) {
+            .complete => |t| {
+                try std.testing.expectEqual(tag.len, t.len);
+                try std.testing.expectEqual(tag[1] == '/', t.close);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "scanThinkTag rejects ordinary tags and partial prefixes" {
+    try std.testing.expect(scanThinkTag("<div>") == .none);
+    try std.testing.expect(scanThinkTag("<tool_call>") == .none);
+    try std.testing.expect(scanThinkTag("<ifm|answer>") == .none);
+    try std.testing.expect(scanThinkTag("<b") == .partial);
+    try std.testing.expect(scanThinkTag("<think") == .partial);
+    try std.testing.expect(scanThinkTag("<ifm|think") == .partial);
+}
+
+test "splitThinkContent drops the leaked draft before an orphan namespaced closer" {
+    // Regression: before `scanThinkTag`, only `<think>`/`</think>` were
+    // recognised, so the namespaced closer stayed ordinary text and the leaked
+    // draft before it was returned as the visible answer.
+    const a = std.testing.allocator;
+    // The prod shape: the gateway leaks a complete draft answer as content,
+    // then the model's own closing reasoning tag (no opener), then the answer.
+    const input = "Draft answer A.\n</ifm|think>\nThe real answer B.";
+    const split = try splitThinkContent(a, input);
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("The real answer B.", split.visible);
+    try std.testing.expect(split.reasoning == null);
+}
+
+test "splitThinkContent keeps text after an orphan closer only when it is non-empty" {
+    const a = std.testing.allocator;
+    const split = try splitThinkContent(a, "answer</ifm|think>");
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("answer", split.visible);
+}
+
+test "splitThinkContent extracts a namespaced reasoning block" {
+    // Regression: a namespaced reasoning block used to be returned verbatim in
+    // `visible` with no reasoning split.
+    const a = std.testing.allocator;
+    const split = try splitThinkContent(a, "<ifm|think>reasoning</ifm|think>Answer");
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("Answer", split.visible);
+    try std.testing.expectEqualStrings("reasoning", split.reasoning.?);
+}
+
+test "stripThinkBlocks drops the leaked draft before an orphan namespaced closer" {
+    // Regression: the leaked draft was returned because the namespaced closer
+    // was not a recognised reasoning tag.
+    const a = std.testing.allocator;
+    const out = try stripThinkBlocks(a, "Draft answer A.\n</ifm|think>\nThe real answer B.");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("The real answer B.", out);
 }
 
 test "stripToolCallMarkup removes the K2 tool call and keeps surrounding text" {
