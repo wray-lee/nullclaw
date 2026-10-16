@@ -3365,6 +3365,11 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
 }
 
 test "assistant reasoning_content is serialized only when set" {
+    // Regression: an OpenAI-compatible endpoint that requires a thinking
+    // field on assistant history (IFM K2 answers 400 "Add a supported
+    // thinking field to each assistant message") needs reasoning_content on
+    // assistant messages; it must be emitted only when set so that other
+    // endpoints are unaffected.
     const allocator = std.testing.allocator;
     const msgs = [_]ChatMessage{
         ChatMessage.user("hi"),
@@ -3378,6 +3383,9 @@ test "assistant reasoning_content is serialized only when set" {
 }
 
 test "missing thinking field error switches assistant history to reasoning_content once" {
+    // Regression: IFM K2 rejected every turn after the first with that 400,
+    // so a session kept failing until /new; the provider must resend once
+    // with an empty reasoning_content, and only for that specific error.
     const allocator = std.testing.allocator;
     root.clearLastApiErrorDetail();
     defer root.clearLastApiErrorDetail();

@@ -499,6 +499,11 @@ pub fn curlStream(
                     _ = child.wait() catch {};
                     // Keep the provider's message: without it the channel can
                     // only show a generic "An error occurred" for a 400.
+                    // NOTE: No unit test for this recording — it only runs with
+                    // a live child and a JSON error body. summarizeKnownApiError
+                    // and setLastApiErrorDetail are covered by their own tests
+                    // (error_classify.zig, and the compatible.zig resend test);
+                    // here the provider text is preserved, not transformed.
                     var summary_buf: [1024]u8 = undefined;
                     if (error_classify.summarizeKnownApiError(p.value.object, &summary_buf)) |summary| {
                         const sanitized = root.sanitizeApiError(allocator, summary) catch null;
