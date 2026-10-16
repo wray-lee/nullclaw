@@ -954,6 +954,7 @@ pub const Agent = struct {
     const TOOL_USE_WITHOUT_CALL_NUDGE = "SYSTEM: The previous turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
     const SETTLED_TOOLS_NO_ANSWER_NUDGE = "SYSTEM: The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch.";
     const REASONING_ONLY_NUDGE = "SYSTEM: The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
+    const TEXT_TOOL_CALL_NUDGE = "SYSTEM: The previous reply contained tool-call markup (for example a stray </function> closer) but no executable tool call was parsed, so nothing ran for that call. Continue from the current state: call the tool you need through the tool interface, or produce the final user-visible answer now. Do not print tool-call markup.";
 
     const EmptyResponseNudge = enum { generic, settled_tools, reasoning_only };
 
@@ -2203,6 +2204,7 @@ pub const Agent = struct {
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
         var tool_use_retry_count: u32 = 0;
+        var text_tool_call_retry_count: u32 = 0;
         var tools_ran_this_turn: bool = false;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
@@ -2622,6 +2624,31 @@ pub const Agent = struct {
                     return error.NoResponseContent;
                 }
 
+                // A reply whose visible text still carries a dangling tool-call
+                // closer (a garbled text tool call: the prod reply announced one
+                // more round and then emitted a lone `</function>`) is an
+                // incomplete turn, not an answer. The signal is structural, so
+                // it works for a reply the prose phrase list below cannot match.
+                // Nudge once with the same bounded machinery as the other
+                // stalls; if it recurs the reply is delivered with the markup
+                // stripped (composeFinalReply), never verbatim.
+                if (text_tool_call_retry_count < 1 and
+                    iteration + 1 < self.max_tool_iterations and
+                    (try providers.helpers.hasOrphanToolCallClose(self.allocator, display_text)))
+                {
+                    // Store the markup-free text so no re-render of history leaks
+                    // the closer and the model does not re-read its own garbled
+                    // text tool call.
+                    const nudge_text = try providers.stripToolCallMarkup(self.allocator, display_text);
+                    defer self.allocator.free(nudge_text);
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(nudge_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, TEXT_TOOL_CALL_NUDGE) });
+                    self.trimHistory();
+                    self.freeResponseFields(&response);
+                    text_tool_call_retry_count += 1;
+                    continue;
+                }
+
                 // Guardrail: if the model promises "I'll try/check now" but emits no
                 // tool call, force one follow-up completion to either act now or
                 // explicitly state the limitation without deferred promises.
@@ -2669,10 +2696,15 @@ pub const Agent = struct {
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
 
-                // Dupe from display_text directly (not from final_text) to avoid double-dupe
+                // Store the same markup-free text the user saw: composeFinalReply
+                // strips tool-call markup for delivery, so history must match it
+                // (a re-render of history must not leak the closer, and the model
+                // must not re-read its own garbled text tool call next turn).
+                const history_text = try providers.stripToolCallMarkup(self.allocator, display_text);
+                defer self.allocator.free(history_text);
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
-                    .content = try self.dupeForHistory(display_text),
+                    .content = try self.dupeForHistory(history_text),
                 });
 
                 // Auto-compaction before hard trimming to preserve context.
@@ -12695,4 +12727,158 @@ test "Agent turn returns announcing prose without a structural retry (step-5 sha
     defer allocator.free(response);
     try std.testing.expectEqualStrings("先把 key 拿出来，改脚本重测。", response);
     try std.testing.expectEqual(@as(usize, 1), state.idx);
+}
+
+test "Agent turn nudges once on a garbled text tool call and delivers the clean retry" {
+    // Regression: pre-fix the reply was delivered verbatim after a single
+    // provider call — the lone orphan `</function>` reached the user. The guard
+    // retries once and the retry's real answer is delivered with no markup.
+    const allocator = std.testing.allocator;
+    const garbled = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = garbled },
+        .{ .text = "最终答案：电池容量 5000mAh。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("最终答案：电池容量 5000mAh。", response);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn delivers the stripped answer when the text tool call recurs" {
+    // Regression: pre-fix the garbled reply was delivered verbatim after a
+    // single provider call (one call, closer intact). With the bounded retry
+    // exhausted, the reply is delivered with the markup stripped, never verbatim.
+    const allocator = std.testing.allocator;
+    const garbled = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = garbled },
+        .{ .text = garbled },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n", response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "</function") == null);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn does not retry a balanced function-markup answer" {
+    // Regression: pre-fix the reply was delivered verbatim, so the balanced
+    // pair (and its closer) reached the user. A balanced pair outside a code
+    // fence is prose, not a garbled call, so the structural guard does not
+    // fire (one call); composeFinalReply still strips the markup from the
+    // delivered reply.
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = "Use <function name=\"read\">body</function> in the docs." },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("hi");
+    defer allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 1), state.idx);
+    try std.testing.expect(std.mem.indexOf(u8, response, "in the docs.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "</function") == null);
+}
+
+test "Agent turn nudges once on a truncated function= text tool call" {
+    // Regression: pre-fix the bare `<function=web_search>` was delivered
+    // verbatim (one call). OpenAI `=` dialect: the model announces a search and
+    // emits a bare `<function=web_search>` with no close; the guard retries once.
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = "先查一下。\n<function=web_search>" },
+        .{ .text = "最终答案。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("最终答案。", response);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn delivers the stripped answer when the function= call recurs" {
+    // Regression: pre-fix the garbled reply was delivered verbatim (one call).
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = "先查一下。\n<function=web_search>" },
+        .{ .text = "先查一下。\n<function=web_search>" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("先查一下。\n", response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "<function=") == null);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn stores the history reply free of tool-call markup" {
+    // Regression: pre-fix the raw closer was stored in history (one call). The
+    // delivered reply is stripped, and so is every stored assistant entry: a
+    // re-render of history must not leak the closer, and the model must not
+    // re-read its own garbled text tool call.
+    const allocator = std.testing.allocator;
+    const garbled = "核心数据到手了。\n</function>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = garbled },
+        .{ .text = garbled },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+
+    var saw_answer = false;
+    for (agent.history.items) |msg| {
+        if (msg.role != .assistant) continue;
+        try std.testing.expect(std.mem.indexOf(u8, msg.content, "</function") == null);
+        if (std.mem.indexOf(u8, msg.content, "核心数据到手了。") != null) saw_answer = true;
+    }
+    try std.testing.expect(saw_answer);
+}
+
+test "Agent turn nudges on a lone closer after an unclosed fence" {
+    // Regression: pre-fix the lone closer after an unclosed fence was delivered
+    // verbatim (one call). An unterminated fence must not hide the garbled
+    // closer from the structural guard.
+    const allocator = std.testing.allocator;
+    const garbled = "好的，对比表如下：\n```\n| 机型 | 电池容量 |\n</function>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = garbled },
+        .{ .text = "最终答案。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("最终答案。", response);
 }
