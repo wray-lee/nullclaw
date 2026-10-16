@@ -1069,7 +1069,10 @@ Deltas are coalesced (at most one API call per second per turn) to stay inside S
 per-method rate limits. Tool-call markup is always stripped before anything is sent. If a
 native streaming call fails with a permanent error (`channel_type_not_supported`,
 `missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
-that account and uses edited messages from then on.
+that account and uses edited messages from then on. A turn whose streamed text grows past
+Slack's per-message cap also leaves the native transport: nullclaw closes the stream and
+finishes the turn on the edited-message transport (capped `chat.update` plus thread
+follow-ups), so a long reply is delivered intact instead of failing with `msg_too_long`.
 
 #### Live reasoning in drafts
 

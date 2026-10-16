@@ -862,7 +862,7 @@ Slack 示例：
 - **原生流式**——目标是 thread 时（`reply_to_mode = all`、入站消息本身是 thread 回复，或 assistant thread），nullclaw 依次调用 `chat.startStream`、限流的 `chat.appendStream`，最后 `chat.stopStream`。Slack 只允许在 thread 内流式输出，因此顶层目标不会走这条通路。
 - **编辑消息**——顶层目标，或 Slack 拒绝原生方法时，nullclaw 用 `chat.postMessage` 发一条消息，再用限流的 `chat.update` 更新它。
 
-增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。
+增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。当某一轮的流式文本超过 Slack 单条消息上限时，也会离开原生通路：nullclaw 关闭流式消息，并在编辑消息通路上结束该轮（受限的 `chat.update` 加 thread 追加消息），从而完整送达长回复，而不是以 `msg_too_long` 失败。
 
 #### 草稿中的实时推理
 
