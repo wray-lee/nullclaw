@@ -1226,13 +1226,19 @@ pub const Config = struct {
                 if (has_agents) {
                     const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
                     defer self.allocator.free(serialized_agents);
-                    // Pre-initialize every slot so the single cleanup defer below
-                    // is safe even when the loop errors part-way: unfilled slots
-                    // free a null api_key. (Previously an errdefer over the filled
-                    // prefix and this defer both freed the same api_key strings on
-                    // error — a latent double free.)
+                    // Pre-initialize every slot and register the cleanup before
+                    // the serialization loop, so it is armed even when the loop
+                    // errors part-way: unfilled slots free a null api_key.
+                    // (Previously an errdefer over the filled prefix and this
+                    // defer both freed the same api_key strings on error — a
+                    // latent double free.)
                     for (serialized_agents) |*slot| {
                         slot.* = .{ .name = "", .provider = "", .model = "" };
+                    }
+                    defer {
+                        for (serialized_agents) |agent_cfg| {
+                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+                        }
                     }
                     for (self.agents, 0..) |agent_cfg, i| {
                         const encrypted_key = try self.encryptConfigSecret(&store, agent_cfg.api_key);
@@ -1248,11 +1254,6 @@ pub const Config = struct {
                             .enable_pii_redaction = agent_cfg.enable_pii_redaction,
                             .autonomy = agent_cfg.autonomy,
                         };
-                    }
-                    defer {
-                        for (serialized_agents) |agent_cfg| {
-                            if (agent_cfg.api_key) |value| self.allocator.free(value);
-                        }
                     }
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
@@ -4957,7 +4958,7 @@ test "agents.list autonomy round trips through save" {
 
 test "invalid autonomy level aborts the parse before any field is written" {
     const allocator = std.testing.allocator;
-    // `workspace` is parsed before `autonomy` in parseJson. An unknown level must
+    // Regression: `workspace` is parsed before `autonomy` in parseJson. An unknown level must
     // fail the parse before that (or any) field is written, so Config.load does
     // not keep a half-parsed config that silently drops the rest.
     const json =
@@ -4970,6 +4971,8 @@ test "invalid autonomy level aborts the parse before any field is written" {
 
 test "invalid per-agent autonomy level aborts the parse before any field is written" {
     const allocator = std.testing.allocator;
+    // Regression: an unknown per-agent level must fail the parse before any
+    // field is written, so Config.load does not keep a half-parsed config.
     const json =
         \\{"workspace": "/tmp/should-not-be-applied",
         \\ "agents": {"list": [
@@ -4980,6 +4983,35 @@ test "invalid per-agent autonomy level aborts the parse before any field is writ
     try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
     try std.testing.expect(cfg.workspace_dir_override == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.agents.len);
+}
+
+fn saveAgentsForAllocationTest(allocator: std.mem.Allocator, base: []const u8, config_path: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.agents = &[_]NamedAgentConfig{
+        .{ .name = "guest-a", .provider = "anthropic", .model = "claude-haiku-3.5", .api_key = "sk-agent-a" },
+        .{ .name = "guest-b", .provider = "anthropic", .model = "claude-haiku-3.5", .api_key = "sk-agent-b" },
+    };
+    try cfg.save();
+}
+
+test "save frees serialized agent api keys when a later write fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    // Regression: Config.save serialized each agent's api_key into a scratch
+    // array that both an errdefer (over the filled prefix) and a defer (over the
+    // whole array) freed, so a failure after the loop — for example writing the
+    // serialized list — freed the same api_key strings twice.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, saveAgentsForAllocationTest, .{ base, config_path });
 }
 
 test "json parse root agent pii redaction flag" {
