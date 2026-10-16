@@ -332,9 +332,7 @@ fn stopWatcherAndReap(
     cancel_done: *std.atomic.Value(bool),
     cancel_watcher: *?std.Thread,
 ) void {
-    http_util.stopCancelWatcher(cancel_done, cancel_watcher);
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    http_util.stopCancelWatcherAndReap(child, cancel_done, cancel_watcher);
 }
 
 /// True when a stdin write failure must be reported as a user interrupt.
@@ -470,10 +468,7 @@ pub fn curlStream(
     var cancel_done = std.atomic.Value(bool).init(false);
     var cancel_watcher: ?std.Thread = null;
     var cancel_ctx: http_util.CancelWatcherCtx = undefined;
-    if (cancel_flag) |flag| {
-        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
-        cancel_watcher = std.Thread.spawn(.{}, http_util.cancelWatcherMain, .{&cancel_ctx}) catch null;
-    }
+    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
     // Safety net only: every path below stops the watcher before reaping curl
     // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
     // window. This defer is a no-op once that has happened.
@@ -511,6 +506,13 @@ pub fn curlStream(
     var in_reasoning = false;
 
     outer: while (true) {
+        // /stop: abort before draining the deltas curl already buffered in its
+        // stdout pipe. Reading them out (each through the stream callback) kept
+        // the turn alive for seconds after the stop.
+        if (http_util.interruptRequested()) {
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
         const n = stdout_file.read(&read_buf) catch |err| {
             if (log_enabled) {
                 debug_log.info("stdout read error: {}", .{err});
@@ -567,6 +569,13 @@ pub fn curlStream(
                 switch (result) {
                     .delta => |content| {
                         defer content.deinit(allocator);
+                        // Check between deltas too: one 4 KiB read can carry
+                        // dozens of buffered deltas, and each callback may block
+                        // on a full outbound queue.
+                        if (http_util.interruptRequested()) {
+                            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            return error.Interrupted;
+                        }
                         try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
                     },
                     .usage => |u| stream_usage = u,
@@ -855,19 +864,26 @@ pub fn curlStreamAnthropic(
 
     try child.spawn();
 
+    // Abort the in-flight stream when the agent /stop raises the interrupt
+    // flag: the watcher kills curl and the read loop below returns
+    // error.Interrupted instead of running the request to completion.
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -886,6 +902,12 @@ pub fn curlStreamAnthropic(
     var read_buf: [4096]u8 = undefined;
 
     outer: while (true) {
+        // /stop: stop reading at the next delta boundary instead of draining
+        // every delta the provider already buffered.
+        if (http_util.interruptRequested()) {
+            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            return error.Interrupted;
+        }
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
 
@@ -903,6 +925,10 @@ pub fn curlStreamAnthropic(
                     },
                     .delta => |text| {
                         defer allocator.free(text);
+                        if (http_util.interruptRequested()) {
+                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            return error.Interrupted;
+                        }
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
@@ -924,12 +950,22 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
+    // A /stop killed curl before the stream finished: report the interrupt
+    // instead of salvaging the partial text as a completed response.
+    if (!saw_done and http_util.interruptRequested()) {
+        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        return error.Interrupted;
+    }
+
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch |err| {
         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
@@ -1342,4 +1378,73 @@ test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
     // Regression: a /stop that kills curl mid-upload surfaces as a write error;
     // the flag must win so the caller ends the turn with the interrupt reply.
     try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
+}
+
+test "curlStream stops reading buffered deltas when the interrupt flag is raised" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    // A local server that emits a bounded SSE stream and closes, so the read
+    // loop can only stop early by consulting the interrupt flag between deltas.
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const delta_count = 40;
+    const Ctx = struct {
+        server: *std_compat.net.Server,
+
+        fn serve(ctx: *@This()) void {
+            var conn = ctx.server.accept() catch return;
+            defer conn.stream.close();
+
+            // Read the request head so curl starts streaming.
+            var buf: [4096]u8 = undefined;
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const n = conn.stream.read(buf[filled..]) catch return;
+                if (n == 0) break;
+                filled += n;
+                if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+            }
+
+            conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n") catch return;
+            var i: usize = 0;
+            while (i < delta_count) : (i += 1) {
+                conn.stream.writeAll("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n") catch return;
+            }
+        }
+    };
+    var ctx = Ctx{ .server = &server };
+    const server_thread = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
+    defer server_thread.join();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/chat/completions", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    var flag = std.atomic.Value(bool).init(false);
+    http_util.setThreadInterruptFlag(&flag);
+    defer http_util.setThreadInterruptFlag(null);
+
+    const Counter = struct {
+        calls: usize = 0,
+        flag: *std.atomic.Value(bool),
+
+        fn cb(ptr: *anyopaque, _: root.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Raise the interrupt after the first delta, as /stop would mid-stream.
+            self.flag.store(true, .release);
+        }
+    };
+    var counter = Counter{ .flag = &flag };
+
+    const result = curlStream(allocator, url, "{}", null, &.{}, 0, Counter.cb, @ptrCast(&counter));
+
+    // Regression: without the read-loop interrupt check the loop drained every
+    // delta curl had already buffered (each through the callback) before the
+    // post-loop check ran, so the turn outlived the stop by seconds.
+    try std.testing.expectError(error.Interrupted, result);
+    try std.testing.expect(counter.calls <= 2);
 }
