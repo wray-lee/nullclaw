@@ -2210,6 +2210,11 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                // Expose the agent interrupt flag to the provider stream so /stop
+                // can abort an in-flight generation (curlStream kills the curl
+                // child, which unblocks the read loop).
+                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
+                defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2230,6 +2235,14 @@ pub const Agent = struct {
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
+                    // /stop aborted the in-flight stream before it produced any
+                    // output (curlStream returns error.Interrupted when the
+                    // cancel watcher fired). This is a user stop, not a provider
+                    // failure: end the turn with the normal interrupt reply
+                    // rather than recording a failure, retrying, or surfacing a
+                    // generic provider error to the channel.
+                    if (err == error.Interrupted) return self.interruptedReply();
+
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
@@ -2267,6 +2280,11 @@ pub const Agent = struct {
                             self.stream_callback.?,
                             self.stream_ctx.?,
                         ) catch |retry_err| {
+                            // /stop can also land while this post-vision-error
+                            // retry stream is running. End the turn with the
+                            // interrupt reply instead of surfacing the raw error
+                            // and degrading the route for a user-initiated stop.
+                            if (retry_err == error.Interrupted) return self.interruptedReply();
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2453,6 +2471,14 @@ pub const Agent = struct {
                 };
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
+
+            // /stop may have aborted the in-flight stream. Honor it before the
+            // response is used at all, otherwise a partial reply would be
+            // returned as if the turn had completed.
+            if (self.isInterruptRequested()) {
+                self.freeResponseFields(&response);
+                return self.interruptedReply();
+            }
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
@@ -11007,6 +11033,179 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
     try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
+}
+
+test "Agent ends the turn with the interrupt reply when the stream is interrupted" {
+    const InterruptProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // /stop aborted the stream before any output: curlStream returns
+            // error.Interrupted, which must end the turn (no retry, no generic
+            // provider error surfaced to the channel).
+            return error.Interrupted;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "interrupt-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = InterruptProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = InterruptProvider.chatWithSystem,
+        .chat = InterruptProvider.chat,
+        .supportsNativeTools = InterruptProvider.supportsNativeTools,
+        .getName = InterruptProvider.getName,
+        .deinit = InterruptProvider.deinitFn,
+        .supports_streaming = InterruptProvider.supportsStreaming,
+        .stream_chat = InterruptProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 3;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    // One attempt: the interrupt is terminal, not retried.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+}
+
+test "Agent ends the turn with the interrupt reply when /stop lands during the vision retry" {
+    const VisionRetryInterruptProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // First attempt trips the vision auto-disable retry; /stop then lands
+            // while that retry stream runs and curlStream returns Interrupted.
+            if (self.calls == 1) return error.ProviderDoesNotSupportVision;
+            return error.Interrupted;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "vision-retry-interrupt-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = VisionRetryInterruptProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = VisionRetryInterruptProvider.chatWithSystem,
+        .chat = VisionRetryInterruptProvider.chat,
+        .supportsNativeTools = VisionRetryInterruptProvider.supportsNativeTools,
+        .getName = VisionRetryInterruptProvider.getName,
+        .deinit = VisionRetryInterruptProvider.deinitFn,
+        .supports_streaming = VisionRetryInterruptProvider.supportsStreaming,
+        .stream_chat = VisionRetryInterruptProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 3;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    // The vision retry ran (2 calls), and the /stop during it ended the turn
+    // with the interrupt reply instead of the raw error being surfaced.
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {

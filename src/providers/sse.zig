@@ -320,6 +320,35 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return null;
 }
 
+/// Stop the cancel watcher, then kill and reap curl.
+///
+/// The watcher must be joined BEFORE `wait()` reaps the child: a still-running
+/// watcher otherwise calls `kill(child.id)` in the window after the kernel has
+/// returned that PID to the OS, and a freshly spawned process can reuse it, so
+/// the watcher would signal an unrelated process. This mirrors the established
+/// `http_util.abortCurlChild` ordering (stop watcher, then kill/wait).
+fn stopWatcherAndReap(
+    child: *std_compat.process.Child,
+    cancel_done: *std.atomic.Value(bool),
+    cancel_watcher: *?std.Thread,
+) void {
+    http_util.stopCancelWatcher(cancel_done, cancel_watcher);
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+}
+
+/// True when a stdin write failure must be reported as a user interrupt.
+///
+/// A /stop raises the agent interrupt flag; the cancel watcher then kills curl
+/// mid-upload, so `writeAll(body)` fails with a broken pipe instead of reaching
+/// the read-loop interrupt check. Consulting the flag lets the caller end the
+/// turn with the interrupt reply rather than reporting the stop as a provider
+/// write failure.
+fn stdinWriteFailureIsInterrupt(cancel_flag: ?*const std.atomic.Value(bool)) bool {
+    if (cancel_flag) |flag| return flag.load(.acquire);
+    return false;
+}
+
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
 /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
@@ -433,19 +462,37 @@ pub fn curlStream(
         debug_log.info("curl process spawned, pid={d}", .{pid});
     }
 
+    // Abort the stream when the agent interrupt flag is raised (e.g. /stop
+    // during a runaway generation). Killing curl closes the stdout pipe, so
+    // the blocking read below returns and this function returns
+    // error.Interrupted so the caller ends the turn instead of retrying.
+    const cancel_flag = http_util.currentThreadInterruptFlag();
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, http_util.cancelWatcherMain, .{&cancel_ctx}) catch null;
+    }
+    // Safety net only: every path below stops the watcher before reaping curl
+    // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
+    // window. This defer is a no-op once that has happened.
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            // A /stop can kill curl before the body finishes uploading; the
+            // failed write would otherwise mask the interrupt as a provider error.
+            if (stdinWriteFailureIsInterrupt(cancel_flag)) return error.Interrupted;
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -496,13 +543,13 @@ pub fn curlStream(
             if (parsed) |p| {
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                    _ = child.wait() catch {};
+                    stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
                     return error_classify.kindToError(kind);
                 }
             }
 
             // Return a meaningful error
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
@@ -542,6 +589,22 @@ pub fn curlStream(
         debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
     }
 
+    // A /stop raised the interrupt flag and the watcher killed curl, so the
+    // stream was cut. Return a distinct error rather than salvaging the partial
+    // text: this can happen before any byte arrives (accumulated_len == 0),
+    // where the old code returned error.CurlFailed and the compatible provider
+    // fell back to a fresh non-streaming request — silently ignoring the stop.
+    // The fallback/retry layers must propagate error.Interrupted and the agent
+    // must end the turn with the normal interrupt reply.
+    if (!saw_done) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                return error.Interrupted;
+            }
+        }
+    }
+
     // Parse a trailing line when the stream ends without a final '\n'.
     if (!saw_done and line_buf.items.len > 0) {
         const trailing = parseSseLine(allocator, line_buf.items) catch null;
@@ -571,6 +634,10 @@ pub fn curlStream(
     if (log_enabled) {
         debug_log.info("waiting for curl process to exit...", .{});
     }
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopWatcherAndReap). The stdout stream is already at EOF, so the watcher
+    // has nothing left to unblock.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
@@ -1265,4 +1332,14 @@ test "extractStreamUsage returns null for null usage field" {
         \\{"id":"chatcmpl-abc","choices":[{"delta":{"content":"Hi"}}],"usage":null}
     ;
     try std.testing.expect(extractStreamUsage(json) == null);
+}
+
+test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(&flag));
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(null));
+    flag.store(true, .release);
+    // Regression: a /stop that kills curl mid-upload surfaces as a write error;
+    // the flag must win so the caller ends the turn with the interrupt reply.
+    try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
 }
