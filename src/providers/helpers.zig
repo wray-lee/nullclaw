@@ -45,6 +45,10 @@ pub const ThinkTag = struct {
     close: bool,
     /// Total byte length, including `<`, `</` and the terminating `>`.
     len: usize,
+    /// True for a namespaced or pipe-delimited spelling (`</ifm|think>`,
+    /// `<mm:think>`, `<|think|>`) — a gateway artifact that is never prose,
+    /// unlike the plain `<think>`/`</think>` a reply may name literally.
+    namespaced: bool,
 };
 
 /// How a `<`-prefixed byte run classifies as a reasoning tag.
@@ -91,7 +95,7 @@ pub fn scanThinkTag(text: []const u8) ThinkTagScan {
     if (i < text.len and text[i] == '>') {
         i += 1;
         if (!isThinkLeaf(leaf)) return .none;
-        return .{ .complete = .{ .close = close, .len = i } };
+        return .{ .complete = .{ .close = close, .len = i, .namespaced = had_sep } };
     }
     if (i >= text.len) {
         // Incomplete: valid iff the leaf can still become think/thinking, or
@@ -129,6 +133,135 @@ fn hasThinkTag(text: []const u8) bool {
 pub fn hasOrphanReasoningCloseBoundary(before: []const u8, after: []const u8) bool {
     return std.mem.trim(u8, before, " \t\r\n").len > 0 and
         std.mem.trim(u8, after, " \t\r\n").len > 0;
+}
+
+// ── Markdown code regions ────────────────────────────────────────────────
+//
+// The XML `function` tool dialect can appear literally in a fenced block or an
+// inline code span (a documented XML sample, a discussion of the dialect). A
+// sample is not markup: it must be preserved verbatim by the batch stripper and
+// must not blank the whole reply in `containsToolCallMarkup`. OpenClaw guards
+// the same way (`isInsideCode` over `findMarkdownCodeRegions`).
+
+pub const CodeRegion = struct { start: usize, end: usize };
+
+/// True when `pos` is inside one of the sorted, non-overlapping `regions`.
+pub fn isInsideCode(regions: []const CodeRegion, pos: usize) bool {
+    var lo: usize = 0;
+    var hi: usize = regions.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const region = regions[mid];
+        if (pos < region.start) {
+            hi = mid;
+        } else if (pos >= region.end) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn codeRunLen(text: []const u8, start: usize) usize {
+    const ch = text[start];
+    var i = start;
+    while (i < text.len and text[i] == ch) i += 1;
+    return i - start;
+}
+
+/// Byte ranges of Markdown code in `text`: fenced blocks (``` / ~~~, opened by
+/// a run of three or more at the start of a line) and inline code spans (a
+/// backtick run closed by an equal run). Caller frees the returned slice.
+pub fn findCodeRegions(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
+    return findCodeRegionsInternal(allocator, text, true);
+}
+
+/// Like `findCodeRegions` but does not treat a trailing *unterminated* fence as
+/// code. The tool-call-markup scanners use this so a model that opens a fence
+/// and then degenerates into a garbled text tool call (a reply that promised a
+/// comparison table, opened ``` and then emitted a lone `</function>`) still
+/// has that closer scanned as visible text. A fence that actually closes is
+/// still code, so a documented sample inside it is preserved.
+pub fn findCodeRegionsForToolMarkup(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
+    return findCodeRegionsInternal(allocator, text, false);
+}
+
+fn findCodeRegionsInternal(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    unterminated_fence_is_code: bool,
+) ![]CodeRegion {
+    var regions: std.ArrayListUnmanaged(CodeRegion) = .empty;
+    errdefer regions.deinit(allocator);
+
+    var i: usize = 0;
+    var at_line_start = true;
+    var fence_ch: u8 = 0;
+    var fence_len: usize = 0;
+    var fence_start: usize = 0;
+    var span_len: usize = 0;
+    var span_start: usize = 0;
+    while (i < text.len) {
+        if (at_line_start) {
+            at_line_start = false;
+            var j = i;
+            var indent: usize = 0;
+            while (j < text.len and text[j] == ' ' and indent < 4) : (indent += 1) j += 1;
+            if (indent <= 3 and j < text.len and (text[j] == '`' or text[j] == '~')) {
+                const run = codeRunLen(text, j);
+                if (fence_ch == 0 and run >= 3) {
+                    fence_ch = text[j];
+                    fence_len = run;
+                    fence_start = i;
+                    i = j + run;
+                    continue;
+                }
+                if (fence_ch == text[j] and run >= fence_len) {
+                    try regions.append(allocator, .{ .start = fence_start, .end = j + run });
+                    fence_ch = 0;
+                    i = j + run;
+                    continue;
+                }
+            }
+            if (fence_ch != 0) {
+                // Inside a fence every byte is code until the next line start,
+                // where a closing fence can appear.
+                while (i < text.len and text[i] != '\n') i += 1;
+                if (i < text.len) {
+                    i += 1;
+                    at_line_start = true;
+                }
+                continue;
+            }
+        }
+        const b = text[i];
+        if (b == '\n') {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if (b == '`') {
+            const run = codeRunLen(text, i);
+            if (span_len == 0) {
+                span_len = run;
+                span_start = i;
+            } else if (run == span_len) {
+                try regions.append(allocator, .{ .start = span_start, .end = i + run });
+                span_len = 0;
+            }
+            i += run;
+            continue;
+        }
+        i += 1;
+    }
+    // An unterminated fence runs to the end of the text (mid-stream). Callers
+    // that scan for tool-call markup opt out (see `findCodeRegionsForToolMarkup`)
+    // so an unclosed fence cannot hide a trailing garbled closer.
+    if (fence_ch != 0 and unterminated_fence_is_code) {
+        try regions.append(allocator, .{ .start = fence_start, .end = text.len });
+    }
+    return regions.toOwnedSlice(allocator);
 }
 
 /// Result of splitting a response text at <think>…</think> blocks.
@@ -225,10 +358,17 @@ fn toolFunctionCloseLenAt(text: []const u8, start: usize) ?usize {
     for (run_names) |name| {
         if (std.mem.startsWith(u8, text[start..], name)) {
             const after = start + name.len;
-            if (after < text.len and (text[after] == '>' or std.ascii.isWhitespace(text[after]))) {
-                return name.len + 1;
-            }
-            return null;
+            if (after >= text.len) return null;
+            if (text[after] == '>') return name.len + 1;
+            if (!std.ascii.isWhitespace(text[after])) return null;
+            // A whitespace delimiter may be followed by the `>` the model
+            // dropped (`</function >`). Consume the run of whitespace and an
+            // optional `>`, so the whole tag advances and a whitespace-delimited
+            // runaway still counts as a run rather than resetting on the `>`.
+            var end = after;
+            while (end < text.len and std.ascii.isWhitespace(text[end])) end += 1;
+            if (end < text.len and text[end] == '>') end += 1;
+            return end - start;
         }
     }
     return null;
@@ -238,11 +378,20 @@ fn toolFunctionCloseLenAt(text: []const u8, start: usize) ?usize {
 /// close tags (`</function>`, `</function_calls>`, `</tool_calls>`, `</invoke>`,
 /// `</parameter>`), optionally whitespace-separated. That run is the shape a
 /// model degenerates into when it loops until the output cap, so the display
-/// path hides it; a lone mention is prose or a documented sample.
-pub fn hasRepetitiveToolCloseRun(text: []const u8) bool {
+/// path hides it; a lone mention is prose or a documented sample. A run inside a
+/// fenced block or inline code span is a sample too, so code regions are skipped
+/// (otherwise a documented three-closer sample would blank the whole reply).
+pub fn hasRepetitiveToolCloseRun(allocator: std.mem.Allocator, text: []const u8) bool {
+    const code = findCodeRegionsForToolMarkup(allocator, text) catch return false;
+    defer allocator.free(code);
     var i: usize = 0;
     var run: usize = 0;
     while (i < text.len) {
+        if (isInsideCode(code, i)) {
+            run = 0;
+            i += 1;
+            continue;
+        }
         if (std.ascii.isWhitespace(text[i])) {
             i += 1;
             continue;
@@ -1401,6 +1550,15 @@ fn containsDispatcherMarker(text: []const u8) bool {
     return false;
 }
 
+/// True when an exact dispatcher open marker starts at `start`. Such a marker is
+/// never prose, so the code-region guard still strips it inside a fence.
+fn isDispatcherMarkerAt(text: []const u8, start: usize) bool {
+    for (dispatcher_marker_tags) |m| {
+        if (std.mem.startsWith(u8, text[start..], m)) return true;
+    }
+    return false;
+}
+
 /// True when a dispatcher-marker block (`marker + body + close tag`, exactly as
 /// the streaming `TagFilter` buffers it) must be hidden from the display.
 ///
@@ -1605,6 +1763,14 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
     var think_depth: usize = 0;
     var block_idx: usize = 0;
     var i: usize = 0;
+    // A `<function>`/`</function>`/`<parameter>` tag inside a code fence or
+    // inline span is a literal sample, not markup (OpenClaw's `isInsideCode`).
+    // The dispatcher's own markers are still stripped inside code: they are
+    // never prose. An *unterminated* fence does not count as code here
+    // (`findCodeRegionsForToolMarkup`): a garbled closer after an unclosed fence
+    // is markup, not a sample.
+    const code = try findCodeRegionsForToolMarkup(allocator, text);
+    defer allocator.free(code);
     while (i < text.len) {
         // A dispatcher-marker block the shared parse swallowed: skip its whole
         // span (tags and body) in one step.
@@ -1612,6 +1778,15 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
         if (block_idx < blocks.len and blocks[block_idx].start == i) {
             i = blocks[block_idx].end;
             block_idx += 1;
+            continue;
+        }
+        // A non-dispatcher tag byte inside a code region is a literal sample:
+        // copy it verbatim rather than running the markup scan over it.
+        if ((text[i] == '<' or text[i] == '[') and isInsideCode(code, i) and
+            !isDispatcherMarkerAt(text, i))
+        {
+            try out.append(allocator, text[i]);
+            i += 1;
             continue;
         }
         if (text[i] == '<') {
@@ -1694,11 +1869,17 @@ fn scanThinkContent(
                 if (tag.close) {
                     if (depth > 0) {
                         depth -= 1;
-                    } else if (hasOrphanReasoningCloseBoundary(visible_out.items[seg_start..], text[i + tag.len ..])) {
-                        // A stray reasoning closer: the visible text before it
-                        // was leaked reasoning (a draft the model wrote as
-                        // thinking), not the answer. Drop it and keep only what
-                        // follows, matching OpenClaw's orphan-close rule.
+                    } else if (tag.namespaced and
+                        hasOrphanReasoningCloseBoundary(visible_out.items[seg_start..], text[i + tag.len ..]))
+                    {
+                        // A stray *namespaced* reasoning closer (`</ifm|think>`):
+                        // the visible text before it was leaked reasoning (a draft
+                        // the model wrote as thinking), not the answer. Drop it
+                        // and keep only what follows, matching OpenClaw's
+                        // orphan-close rule. The plain `</think>` is excluded: a
+                        // reply may name that tag in prose ("the closing tag is
+                        // </think>."), and OpenClaw's batch splitter keeps the
+                        // preceding text there instead of losing it.
                         visible_out.clearRetainingCapacity();
                         seg_start = 0;
                     }
@@ -2637,12 +2818,21 @@ test "hasRepetitiveToolCloseRun detects the function-dialect runaway" {
     // Regression: `</function` is a prefix of `</function_calls`, and the run
     // tag names were tested shortest-first, so a `</function_calls>` run went
     // undetected.
-    try std.testing.expect(hasRepetitiveToolCloseRun("</function></function></function>"));
-    try std.testing.expect(hasRepetitiveToolCloseRun("</function>\n</function>\n</function>"));
-    try std.testing.expect(hasRepetitiveToolCloseRun("</function_calls></function_calls></function_calls>"));
-    try std.testing.expect(hasRepetitiveToolCloseRun("</tool_calls></tool_calls></tool_calls>"));
-    try std.testing.expect(!hasRepetitiveToolCloseRun("</function></function>"));
-    try std.testing.expect(!hasRepetitiveToolCloseRun("<function_calls><invoke name=\"x\"></invoke></function_calls>"));
+    const a = std.testing.allocator;
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</function></function></function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</function>\n</function>\n</function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</function_calls></function_calls></function_calls>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</tool_calls></tool_calls></tool_calls>"));
+    // Regression: a whitespace-delimited runaway (`</function >`, the model
+    // dropped the `>`) advanced only past the space, so the trailing `>` reset
+    // the run counter and the loop went undetected.
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</function ></function ></function >"));
+    try std.testing.expect(hasRepetitiveToolCloseRun(a, "</function >\n</function >\n</function >"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun(a, "</function></function>"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun(a, "<function_calls><invoke name=\"x\"></invoke></function_calls>"));
+    // Regression: a run inside a code fence is a documented sample, but it was
+    // counted as a runaway, which blanked the whole reply.
+    try std.testing.expect(!hasRepetitiveToolCloseRun(a, "```xml\n</function></function></function>\n```"));
 }
 
 test "stripToolCallMarkup removes the K2 tool call and keeps surrounding text" {
@@ -3129,4 +3319,67 @@ test "stripToolCallMarkup hides a quoted-colon salvaged call" {
     const out = try stripToolCallMarkup(a, input);
     defer a.free(out);
     try std.testing.expectEqualStrings("AB", out);
+}
+
+test "findCodeRegionsForToolMarkup excludes a trailing unterminated fence" {
+    const a = std.testing.allocator;
+    // A fence that closes is a code region.
+    const closed = try findCodeRegionsForToolMarkup(a, "x\n```\ncode\n```\ny");
+    defer a.free(closed);
+    try std.testing.expectEqual(@as(usize, 1), closed.len);
+    try std.testing.expect(isInsideCode(closed, 8));
+    try std.testing.expect(!isInsideCode(closed, 0));
+    // An unterminated fence is not, so a garbled closer after it stays visible.
+    const open = try findCodeRegionsForToolMarkup(a, "x\n```\ncode");
+    defer a.free(open);
+    try std.testing.expectEqual(@as(usize, 0), open.len);
+    // `findCodeRegions` does treat the trailing fence as code (reasoning scan).
+    const trailing = try findCodeRegions(a, "x\n```\ncode");
+    defer a.free(trailing);
+    try std.testing.expectEqual(@as(usize, 1), trailing.len);
+}
+
+test "stripToolCallMarkup keeps a function sample inside a code fence" {
+    // Regression: without code-region awareness the batch stripper removed a
+    // documented `function_calls` sample from the reply.
+    const a = std.testing.allocator;
+    const doc = "Example:\n```xml\n<function_calls><invoke name=\"shell\"></invoke></function_calls>\n```\ndone";
+    const out = try stripToolCallMarkup(a, doc);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<function_calls>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "</function_calls>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "done") != null);
+}
+
+test "stripToolCallMarkup drops a lone closer after an unclosed fence" {
+    // An unterminated fence must not hide the trailing garbled closer from the
+    // strip (the prod reply promised a table, opened ``` and emitted a closer).
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{ "answer\n```\n</function>", "answer\n~~~\n</function>" };
+    for (cases) |input| {
+        const out = try stripToolCallMarkup(a, input);
+        defer a.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "</function") == null);
+    }
+}
+
+test "splitThinkContent keeps prose that names a plain reasoning closer" {
+    // Regression: an orphan plain `</think>` cleared the visible buffer, so a
+    // reply that named the tag lost its prose. Only the namespaced/pipe gateway
+    // forms mark a leaked draft in the batch path.
+    const a = std.testing.allocator;
+    const split = try splitThinkContent(a, "The closing tag is </think>.");
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("The closing tag is .", split.visible);
+    try std.testing.expect(split.reasoning == null);
+}
+
+test "stripThinkBlocks keeps prose that names a plain reasoning closer" {
+    // Regression: an orphan plain `</think>` cleared the visible buffer, so a
+    // draft preview that named the tag lost its prose.
+    const a = std.testing.allocator;
+    const out = try stripThinkBlocks(a, "The closing tag is </think>.");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("The closing tag is .", out);
 }
