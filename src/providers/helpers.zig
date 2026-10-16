@@ -996,6 +996,26 @@ fn findCodeRegionsInternal(
     if (fence_ch != 0 and unterminated_fence_is_code) {
         try regions.append(allocator, .{ .start = fence_start, .end = text.len });
     }
+    // Regions are appended in the order they CLOSE, so a nested inline span that
+    // wraps a fenced block can precede the fence it contains. isInsideCode's
+    // binary search needs a sorted, non-overlapping list, so sort by start and
+    // merge overlaps in place (the wrapped fence and span become one region).
+    std.mem.sort(CodeRegion, regions.items, {}, struct {
+        fn lessThan(_: void, a: CodeRegion, b: CodeRegion) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+    var write: usize = 0;
+    for (regions.items) |region| {
+        if (write > 0 and region.start <= regions.items[write - 1].end) {
+            if (region.end > regions.items[write - 1].end)
+                regions.items[write - 1].end = region.end;
+        } else {
+            regions.items[write] = region;
+            write += 1;
+        }
+    }
+    regions.shrinkRetainingCapacity(write);
     return regions.toOwnedSlice(allocator);
 }
 
@@ -1236,6 +1256,20 @@ fn skipBracketToolCall(text: []const u8, start: usize) ?usize {
     return close_end;
 }
 
+/// Byte length of a `[tool_call]` / `[TOOL_CALL]` opener at `start`, or null.
+fn bracketOpenLen(text: []const u8, start: usize) ?usize {
+    if (std.mem.startsWith(u8, text[start..], "[tool_call]")) return "[tool_call]".len;
+    if (std.mem.startsWith(u8, text[start..], "[TOOL_CALL]")) return "[TOOL_CALL]".len;
+    return null;
+}
+
+/// Byte length of a `[/tool_call]` / `[/TOOL_CALL]` closer at `start`, or null.
+fn bracketCloseLen(text: []const u8, start: usize) ?usize {
+    if (std.mem.startsWith(u8, text[start..], "[/tool_call]")) return "[/tool_call]".len;
+    if (std.mem.startsWith(u8, text[start..], "[/TOOL_CALL]")) return "[/TOOL_CALL]".len;
+    return null;
+}
+
 /// True when `text` holds unbalanced angle-bracket tool-call markup outside any
 /// code fence or inline span: a `</…` close tag with no matching opener, or an
 /// OpenAI `=`-dialect opener (`<function=NAME>` / `<parameter=NAME>`) that never
@@ -1245,7 +1279,10 @@ fn skipBracketToolCall(text: []const u8, start: usize) ?usize {
 /// It is a structural, language-independent signal, so the turn loop keys its
 /// bounded retry on it instead of on assistant prose. A balanced pair
 /// (`<function>…</function>`) is prose and does not qualify, and neither does
-/// markup inside a code sample.
+/// markup inside a code sample. A stray bracket closer (`[/tool_call]`, the
+/// dispatcher's grammar) qualifies on the same terms. This detector is narrower
+/// than `stripToolCallMarkup`, which also drops a balanced pair from the
+/// delivered reply.
 pub fn hasOrphanToolCallClose(allocator: std.mem.Allocator, text: []const u8) !bool {
     if (!hasToolCallMarkup(text)) return false;
     const code = try findCodeRegionsForToolMarkup(allocator, text);
@@ -1254,9 +1291,35 @@ pub fn hasOrphanToolCallClose(allocator: std.mem.Allocator, text: []const u8) !b
     // Whether the outermost open tag is the `=` dialect, whose unclosed form is
     // tool markup rather than a prose mention of a marker name.
     var function_open = false;
+    // The dispatcher's bracket grammar is a separate dialect with its own depth.
+    var bracket_depth: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
-        if (text[i] != '<' or isInsideCode(code, i)) {
+        if (isInsideCode(code, i)) {
+            i += 1;
+            continue;
+        }
+        if (text[i] == '[') {
+            // A stray `[/tool_call]` closer with no matching opener is the same
+            // garbled shape as an orphan angle-bracket closer, so the bounded
+            // retry fires for it too; a balanced bracket pair is a complete
+            // block (prose), and an unclosed `[tool_call]` opener is released as
+            // prose, exactly like the angle-bracket dialects.
+            if (bracketCloseLen(text, i)) |len| {
+                if (bracket_depth == 0) return true;
+                bracket_depth -= 1;
+                i += len;
+                continue;
+            }
+            if (bracketOpenLen(text, i)) |len| {
+                bracket_depth += 1;
+                i += len;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (text[i] != '<') {
             i += 1;
             continue;
         }
@@ -1285,6 +1348,12 @@ pub fn hasOrphanToolCallClose(allocator: std.mem.Allocator, text: []const u8) !b
 /// inline spans (a documented sample is not markup). A closed block, a stray
 /// close tag, and a standalone marker are dropped whole; an unterminated
 /// `=`-dialect opener drops only the tag token, so trailing prose survives.
+///
+/// This is deliberately broader than `hasOrphanToolCallClose`: it also drops a
+/// balanced block (`<function>...</function>`), because the delivered reply must
+/// not carry markup even though the detector treats a balanced pair as prose and
+/// leaves it alone. The detector stays narrow so a prose mention of the markup
+/// does not trigger a retry; the stripper removes any markup it sees.
 pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (!hasToolCallMarkup(text)) return allocator.dupe(u8, text);
     const code = try findCodeRegionsForToolMarkup(allocator, text);
@@ -1446,4 +1515,37 @@ test "hasOrphanToolCallClose flags a lone closer after an unclosed fence" {
     try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n~~~\n</function>"));
     // A closed fence still preserves a documented sample.
     try std.testing.expect(!try hasOrphanToolCallClose(a, "```\n</function>\n```"));
+}
+
+test "findCodeRegions returns a sorted, non-overlapping list when a span wraps a fence" {
+    // Regression: pre-fix regions were appended in the order they close, so an
+    // inline span opened before a fenced block that closes first produced an
+    // unsorted, overlapping list and broke isInsideCode's binary-search
+    // precondition.
+    const a = std.testing.allocator;
+    const regions = try findCodeRegions(a, "x`y\n```\nz\n```\nw`v");
+    defer a.free(regions);
+    var prev_end: usize = 0;
+    for (regions) |r| {
+        try std.testing.expect(r.start >= prev_end);
+        try std.testing.expect(r.end > r.start);
+        prev_end = r.end;
+    }
+    // The wrapped span is one code region: the span opener and a byte inside the
+    // fence both read as code.
+    try std.testing.expect(isInsideCode(regions, 1));
+    try std.testing.expect(isInsideCode(regions, 8));
+}
+
+test "hasOrphanToolCallClose flags a stray bracket closer" {
+    // Regression: pre-fix the detector scanned only '<', so a stray
+    // `[/tool_call]` was stripped by stripToolCallMarkup but never triggered the
+    // bounded retry.
+    const a = std.testing.allocator;
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n[/tool_call]"));
+    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n[/TOOL_CALL]"));
+    // A balanced bracket pair is a complete block, not an orphan closer.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "[tool_call]x[/tool_call]"));
+    // A stray bracket closer inside a code fence is a documented sample.
+    try std.testing.expect(!try hasOrphanToolCallClose(a, "```\n[/tool_call]\n```"));
 }
