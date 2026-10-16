@@ -5385,9 +5385,14 @@ pub fn composeFinalReply(
 ) ![]const u8 {
     // Never deliver tool-call markup to the user. A model can end its reply
     // with a garbled text tool call (for example a lone `</function>` closer)
-    // that the parser could not turn into an executable call; the live preview
-    // hides it, but the final reply is authoritative, so strip it here. Code
-    // fences and inline spans are preserved: a documented sample is not markup.
+    // that the parser could not turn into an executable call, so the delivered
+    // reply is assembled from a markup-free copy of the text. This is the only
+    // guard for that dialect: the streaming preview does not hide it, because
+    // src/streaming.zig TagFilter only suppresses `<tool_call*>`/`<tool_result*>`/
+    // `<think*`, so the `</function>`, `<function>`, `<invoke>`, `<parameter>`
+    // and `antml:`/`mm:` forms pass through on the live-preview surfaces (cli,
+    // telegram, max). The streaming half is a separate follow-up. Code fences
+    // and inline spans are preserved: a documented sample is not markup.
     const clean_base = try providers.stripToolCallMarkup(self.allocator, base_text);
     defer self.allocator.free(clean_base);
 
