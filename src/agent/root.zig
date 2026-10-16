@@ -12380,13 +12380,24 @@ const TurnScript = union(enum) {
 const ScriptedTurnProvider = struct {
     scripts: []const TurnScript,
     idx: usize = 0,
+    /// Last user-role message seen by the provider (the nudge the agent appended
+    /// before the retry). Points into agent-owned history, valid until deinit.
+    last_user_msg: []const u8 = "",
 
     fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
         return allocator.dupe(u8, "");
     }
 
-    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, req: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        var mi = req.messages.len;
+        while (mi > 0) {
+            mi -= 1;
+            if (req.messages[mi].role == .user) {
+                self.last_user_msg = req.messages[mi].content;
+                break;
+            }
+        }
         const script: TurnScript = if (self.idx < self.scripts.len) self.scripts[self.idx] else TurnScript{ .text = "done" };
         self.idx += 1;
         return switch (script) {
@@ -12477,6 +12488,10 @@ test "emptyResponseNudgeCap allows two reasoning-only retries and one otherwise"
 }
 
 test "Agent turn nudges once then fails on finish_tool_use without a tool call" {
+    // Regression: pre-fix this turn was retried with the generic empty-response
+    // nudge (the nudge-text assertion below failed), so it never exercised the
+    // structural finish_tool_use guard. The guard must nudge once with
+    // TOOL_USE_WITHOUT_CALL_NUDGE, then fail with error.NoResponseContent.
     const allocator = std.testing.allocator;
     var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
         .{ .finish_tool_use = "" },
@@ -12490,9 +12505,13 @@ test "Agent turn nudges once then fails on finish_tool_use without a tool call" 
 
     try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
     try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings(Agent.TOOL_USE_WITHOUT_CALL_NUDGE, state.last_user_msg);
 }
 
 test "Agent turn recovers when finish_tool_use is followed by a real answer" {
+    // Not a regression test: pre-fix the announcing prose "I will do that now"
+    // already matched shouldForceActionFollowThrough and recovered, so this pins
+    // that the new structural guard keeps that path working.
     const allocator = std.testing.allocator;
     var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
         .{ .finish_tool_use = "I will do that now" },
@@ -12510,6 +12529,9 @@ test "Agent turn recovers when finish_tool_use is followed by a real answer" {
 }
 
 test "Agent turn uses settled-tools nudge and recovers after tools ran" {
+    // Regression: pre-fix this turn was retried with the generic empty-response
+    // nudge (the nudge-text assertion below failed); the settled-tools guard must
+    // nudge with SETTLED_TOOLS_NO_ANSWER_NUDGE and recover the real answer.
     const ProbeTool = struct {
         const Self = @This();
         count: *usize,
@@ -12559,9 +12581,13 @@ test "Agent turn uses settled-tools nudge and recovers after tools ran" {
     try std.testing.expectEqualStrings("final answer", response);
     try std.testing.expectEqual(@as(usize, 1), probe_count);
     try std.testing.expectEqual(@as(usize, 3), state.idx);
+    try std.testing.expectEqualStrings(Agent.SETTLED_TOOLS_NO_ANSWER_NUDGE, state.last_user_msg);
 }
 
 test "Agent turn fails after the settled-tools nudge is exhausted" {
+    // Not a regression test: pre-fix the generic empty-response retry already
+    // exhausted here and failed the same way, so this pins that the settled-tools
+    // guard fails rather than looping when its budget is spent.
     const ProbeTool = struct {
         const Self = @This();
         pub const tool_name = "probe";
@@ -12609,6 +12635,10 @@ test "Agent turn fails after the settled-tools nudge is exhausted" {
 }
 
 test "Agent turn retries reasoning-only replies up to two times" {
+    // Regression: pre-fix the first reasoning-only reply consumed the single
+    // generic empty-response retry, so the second reasoning-only reply failed the
+    // turn with error.NoResponseContent (provider called twice, idx 2) instead of
+    // recovering. The reasoning-only budget of 2 must recover here.
     const allocator = std.testing.allocator;
     var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
         .{ .reasoning_only = "thinking a" },
@@ -12627,6 +12657,10 @@ test "Agent turn retries reasoning-only replies up to two times" {
 }
 
 test "Agent turn fails after two reasoning-only retries" {
+    // Regression: pre-fix the turn failed on the second reasoning-only reply
+    // (generic budget 1), so the provider was called twice — observed "expected
+    // 3, found 2" on state.idx. The two-retry budget must reach the third reply
+    // and fail there.
     const allocator = std.testing.allocator;
     var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
         .{ .reasoning_only = "thinking a" },
@@ -12644,9 +12678,10 @@ test "Agent turn fails after two reasoning-only retries" {
 }
 
 test "Agent turn returns announcing prose without a structural retry (step-5 shape)" {
-    // finish_reason is "stop" (finish_tool_use=false) and the reply is Chinese
-    // prose announcing an action with no tool call. No structural signal fires;
-    // this shape is handled by the EXECUTION BIAS prompt rule, not the guards.
+    // Not a regression test: this pins existing behaviour the new guards must not
+    // change — finish_reason "stop" carries no structural signal, so the
+    // announcing prose passes through unchanged (the EXECUTION BIAS prompt rule
+    // is the only guard for this shape).
     const allocator = std.testing.allocator;
     var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
         .{ .text = "先把 key 拿出来，改脚本重测。" },

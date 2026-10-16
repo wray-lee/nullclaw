@@ -1278,6 +1278,10 @@ test "buildToolInstructions includes Parameters when native tools disabled" {
 }
 
 test "writeToolInstructionsSection emits EXECUTION BIAS only when tools are present" {
+    // Regression: pre-fix this section emitted no EXECUTION BIAS block, so the
+    // "EXECUTION BIAS:" assertion below failed (observed: std.testing.expect
+    // returned error.TestUnexpectedResult on pre-fix main 5f1cade0). The block
+    // is the prompt-side guard for the prose-shaped stall.
     const allocator = std.testing.allocator;
     const MockTool = struct {
         fn name(_: @This()) []const u8 {
@@ -1313,6 +1317,8 @@ test "writeToolInstructionsSection emits EXECUTION BIAS only when tools are pres
 }
 
 test "buildSystemPrompt omits EXECUTION BIAS when no tools are configured" {
+    // Not a regression test: pre-fix no prompt contained EXECUTION BIAS either,
+    // so this pins that the new block stays gated on tools.len > 0.
     const allocator = std.testing.allocator;
     const prompt = try buildSystemPrompt(allocator, .{
         .workspace_dir = "/tmp/nonexistent",
