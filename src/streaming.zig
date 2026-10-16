@@ -156,6 +156,14 @@ pub const TagFilter = struct {
         "[tool_call",
         "[TOOL_CALL",
         "<think",
+        // OpenAI/Anthropic-style text tool markup. A model that falls back to
+        // this dialect can degenerate into a loop of `</function>` closers that
+        // must never reach a channel (OpenClaw's `TOOL_CALL_TAG_NAMES`).
+        "<function",
+        "<function_calls",
+        "<tool_calls",
+        "<invoke",
+        "<parameter",
     };
 
     // Closing tag *names*, without the trailing delimiter. A close is matched
@@ -173,6 +181,11 @@ pub const TagFilter = struct {
         "<|tool_result_end|",
         "[/tool_call",
         "[/TOOL_CALL",
+        "</function",
+        "</function_calls",
+        "</tool_calls",
+        "</invoke",
+        "</parameter",
     };
 
     // Name only — `isCloseTag` treats the trailing `>`/whitespace as delimiter.
@@ -1076,6 +1089,28 @@ test "TagFilter ends a tool block inside namespaced reasoning at the namespaced 
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Visible answer", col.joined(&buf));
+}
+
+test "TagFilter drops a stray function close tag" {
+    // Regression: the XML `function` dialect was not in the tag set, so a
+    // degenerate loop of `</function>` closers streamed to the user verbatim.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Answer</function></function></function>");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+}
+
+test "TagFilter strips a function_calls block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<function_calls><invoke name=\"shell\"></invoke></function_calls>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
 }
 
 test "ThinkPassthroughFilter passthrough without think tags" {

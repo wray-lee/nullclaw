@@ -149,6 +149,15 @@ const tool_call_open_tags = [_][]const u8{
     "<tool_result_begin",
     "<|tool_call_begin|",
     "<|tool_result_begin|",
+    // Anthropic-style text tool markup and OpenAI's XML `function` dialect.
+    // A model that falls back to one of these can degenerate into a loop of
+    // `</function>` closers; they are tool markup, not an answer (OpenClaw's
+    // `TOOL_CALL_TAG_NAMES` covers the same set).
+    "<function",
+    "<function_calls",
+    "<tool_calls",
+    "<invoke",
+    "<parameter",
 };
 // Close tag *names*, without the trailing delimiter. Like the opens above, a
 // close is matched with either a `>` or a whitespace delimiter, so a model that
@@ -160,6 +169,11 @@ const tool_call_close_names = [_][]const u8{
     "<tool_result_end",
     "<|tool_call_end|",
     "<|tool_result_end|",
+    "</function",
+    "</function_calls",
+    "</tool_calls",
+    "</invoke",
+    "</parameter",
 };
 const tool_call_standalone_names = [_][]const u8{
     "<tool_calls_section_begin",
@@ -182,7 +196,7 @@ const bracket_tool_call_markers = [_][]const u8{
     "[/TOOL_CALL]",
 };
 
-fn hasToolCallMarkup(text: []const u8) bool {
+pub fn hasToolCallMarkup(text: []const u8) bool {
     for (tool_call_open_tags) |t| {
         if (std.mem.indexOf(u8, text, t) != null) return true;
     }
@@ -194,6 +208,53 @@ fn hasToolCallMarkup(text: []const u8) bool {
     }
     for (bracket_tool_call_markers) |t| {
         if (std.mem.indexOf(u8, text, t) != null) return true;
+    }
+    return false;
+}
+
+/// Length (past its delimiter) of an XML `function`-dialect close tag at
+/// `start`, or null. Used only to spot a runaway repetition.
+fn toolFunctionCloseLenAt(text: []const u8, start: usize) ?usize {
+    // Longest first: `</function` is a prefix of `</function_calls`, so the
+    // shorter name would match first and then fail its delimiter check (`_`),
+    // hiding the longer name and missing a `</function_calls>` run.
+    const run_names = [_][]const u8{
+        "</function_calls", "</tool_calls", "</parameter", "</function", "</invoke",
+    };
+    if (text[start] != '<') return null;
+    for (run_names) |name| {
+        if (std.mem.startsWith(u8, text[start..], name)) {
+            const after = start + name.len;
+            if (after < text.len and (text[after] == '>' or std.ascii.isWhitespace(text[after]))) {
+                return name.len + 1;
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/// True when `text` holds a run of three or more dangling XML `function`-dialect
+/// close tags (`</function>`, `</function_calls>`, `</tool_calls>`, `</invoke>`,
+/// `</parameter>`), optionally whitespace-separated. That run is the shape a
+/// model degenerates into when it loops until the output cap, so the display
+/// path hides it; a lone mention is prose or a documented sample.
+pub fn hasRepetitiveToolCloseRun(text: []const u8) bool {
+    var i: usize = 0;
+    var run: usize = 0;
+    while (i < text.len) {
+        if (std.ascii.isWhitespace(text[i])) {
+            i += 1;
+            continue;
+        }
+        if (toolFunctionCloseLenAt(text, i)) |len| {
+            run += 1;
+            if (run >= 3) return true;
+            i += len;
+            continue;
+        }
+        run = 0;
+        i += 1;
     }
     return false;
 }
@@ -2548,6 +2609,40 @@ test "stripThinkBlocks drops the leaked draft before an orphan namespaced closer
     const out = try stripThinkBlocks(a, "Draft answer A.\n</ifm|think>\nThe real answer B.");
     defer a.free(out);
     try std.testing.expectEqualStrings("The real answer B.", out);
+}
+
+test "stripToolCallMarkup drops stray function close tags" {
+    // Regression: the XML `function` dialect was not in the tag set, so a
+    // degenerate loop of `</function>` closers reached the user verbatim.
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "Answer</function></function></function>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("Answer", out);
+}
+
+test "stripToolCallMarkup hides a function_calls block" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "A<function_calls><invoke name=\"shell\"></invoke></function_calls>B");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("AB", out);
+}
+
+test "hasToolCallMarkup detects the function dialect" {
+    try std.testing.expect(hasToolCallMarkup("</function>"));
+    try std.testing.expect(hasToolCallMarkup("<function_calls>"));
+    try std.testing.expect(!hasToolCallMarkup("plain answer"));
+}
+
+test "hasRepetitiveToolCloseRun detects the function-dialect runaway" {
+    // Regression: `</function` is a prefix of `</function_calls`, and the run
+    // tag names were tested shortest-first, so a `</function_calls>` run went
+    // undetected.
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function></function></function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function>\n</function>\n</function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function_calls></function_calls></function_calls>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</tool_calls></tool_calls></tool_calls>"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun("</function></function>"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun("<function_calls><invoke name=\"x\"></invoke></function_calls>"));
 }
 
 test "stripToolCallMarkup removes the K2 tool call and keeps surrounding text" {
